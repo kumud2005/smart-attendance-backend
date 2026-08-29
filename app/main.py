@@ -26,19 +26,22 @@ app = FastAPI(
 # CORS
 # ============================================================================
 #
-# Required for Flutter Web running in Chrome.
+# Allowed frontend origins:
 #
-# Flutter Web development ports are dynamic, for example:
-#   http://localhost:61930
-#   http://localhost:xxxxx
+# 1. Local Flutter Web development:
+#    http://localhost:<dynamic-port>
+#    http://127.0.0.1:<dynamic-port>
 #
-# The regex allows localhost and 127.0.0.1 with any development port.
+# 2. Production Flutter Web deployed on Firebase Hosting.
 #
-# This does NOT allow arbitrary external websites.
 # ============================================================================
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "https://smart-attendance-system-e5a54.web.app",
+        "https://smart-attendance-system-e5a54.firebaseapp.com",
+    ],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
@@ -97,9 +100,8 @@ def database_health_check():
             "database": "connected",
         }
 
-    except Exception as exc:
+    except Exception:
         return {
             "status": "error",
             "database": "disconnected",
-            "detail": str(exc),
         }
