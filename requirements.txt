@@ -1,0 +1,13 @@
+﻿fastapi
+uvicorn[standard]
+sqlalchemy
+pymysql
+python-dotenv
+pydantic-settings
+python-jose[cryptography]
+bcrypt
+python-multipart
+qrcode[pil]>=8.2,<9
+reportlab==5.0.1
+
+XlsxWriter>=3.2,<4

@@ -1,0 +1,32 @@
+# Environment secrets
+.env
+
+# Python virtual environments
+.venv/
+.venv-1/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE files
+.idea/
+.vscode/
+
+# Local/generated testing files
+test_exports/
+DOWNLOADED FILES/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Railway local metadata
+.railway/
+
+# Local source-code backups
+*.backup
+*.backup-*
+*.report-backup
