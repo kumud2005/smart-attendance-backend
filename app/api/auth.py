@@ -6,12 +6,14 @@ from app.db.database import get_db
 from app.schemas.auth import (
     RegisterRequest,
     RegisterResponse,
+    RegistrationOptionsResponse,
     LoginRequest,
     LoginResponse,
 )
 
 from app.services.auth_service import (
     register_user,
+    get_registration_options,
     login_user,
 )
 
@@ -24,6 +26,32 @@ router = APIRouter(
     prefix="/api/auth",
     tags=["Authentication"]
 )
+
+
+# ============================================================
+# PUBLIC REGISTRATION OPTIONS
+# ============================================================
+
+@router.get(
+    "/registration-options",
+    response_model=RegistrationOptionsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def registration_options(
+    semester_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public academic options for Student and Faculty registration.
+
+    Students use Semester -> Section. Faculty uses
+    Semester -> Section -> Subject.
+    """
+
+    return get_registration_options(
+        db=db,
+        semester_id=semester_id,
+    )
 
 
 # ============================================================
@@ -40,7 +68,9 @@ def register(
     db: Session = Depends(get_db)
 ):
     """
-    Register a new Student, Faculty or Admin account.
+    Public registration for STUDENT and FACULTY accounts.
+
+    Administrator accounts must be created by an authenticated Admin.
     """
 
     user = register_user(
@@ -56,7 +86,7 @@ def register(
         account_status=user.account_status,
         message=(
             "Registration successful. "
-            "Account is pending activation."
+            "Account is pending administrator approval."
         )
     )
 

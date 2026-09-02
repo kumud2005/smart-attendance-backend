@@ -72,32 +72,59 @@ def get_faculty_semesters(
     current_user: User,
 ) -> list[dict]:
     """
-    Return all semesters available in the system.
-
-    Semester selection is the first step of the
-    faculty attendance-session creation flow.
+    Return only semesters that currently have at least one active
+    Semester + Section + Subject assignment for this faculty.
     """
 
-    _verify_faculty(current_user)
+    faculty_profile = get_faculty_profile(
+        db=db,
+        current_user=current_user,
+    )
 
     rows = db.execute(
         text(
             """
-            SELECT
-                semester_id,
-                semester_number,
-                semester_name
-            FROM semesters
-            ORDER BY semester_number
+            SELECT DISTINCT
+                sem.semester_id,
+                sem.semester_number,
+                sem.semester_name
+
+            FROM faculty_subject_assignments fsa
+
+            INNER JOIN sections sec
+                ON sec.section_id = fsa.section_id
+
+            INNER JOIN subjects s
+                ON s.subject_id = fsa.subject_id
+
+            INNER JOIN semesters sem
+                ON sem.semester_id = sec.semester_id
+
+            WHERE fsa.faculty_id = :faculty_id
+              AND fsa.is_active = 1
+              AND sec.is_active = 1
+              AND s.is_active = 1
+              AND s.semester_id = sec.semester_id
+
+            ORDER BY
+                sem.semester_number,
+                sem.semester_id
             """
-        )
+        ),
+        {
+            "faculty_id":
+                faculty_profile.faculty_id,
+        },
     ).mappings().all()
 
     return [
         {
-            "semester_id": row["semester_id"],
-            "semester_number": row["semester_number"],
-            "semester_name": row["semester_name"],
+            "semester_id":
+                int(row["semester_id"]),
+            "semester_number":
+                row["semester_number"],
+            "semester_name":
+                row["semester_name"],
         }
         for row in rows
     ]
@@ -113,10 +140,15 @@ def get_faculty_sections_for_semester(
     semester_id: int,
 ) -> list[dict]:
     """
-    Return active sections belonging to the selected semester.
+    Return only active sections from the selected semester that
+    currently have at least one active subject assignment for the
+    authenticated faculty.
     """
 
-    _verify_faculty(current_user)
+    faculty_profile = get_faculty_profile(
+        db=db,
+        current_user=current_user,
+    )
 
     rows = db.execute(
         text(
@@ -130,14 +162,25 @@ def get_faculty_sections_for_semester(
                     DISTINCT ssa.student_id
                 ) AS student_count
 
-            FROM sections sec
+            FROM faculty_subject_assignments fsa
+
+            INNER JOIN sections sec
+                ON sec.section_id = fsa.section_id
+
+            INNER JOIN subjects s
+                ON s.subject_id = fsa.subject_id
 
             LEFT JOIN student_section_assignments ssa
                 ON ssa.section_id = sec.section_id
                AND ssa.is_active = 1
 
-            WHERE sec.semester_id = :semester_id
+            WHERE fsa.faculty_id = :faculty_id
+              AND sec.semester_id = :semester_id
+              AND s.semester_id = :semester_id
+
+              AND fsa.is_active = 1
               AND sec.is_active = 1
+              AND s.is_active = 1
 
             GROUP BY
                 sec.section_id,
@@ -148,15 +191,21 @@ def get_faculty_sections_for_semester(
             """
         ),
         {
-            "semester_id": semester_id,
+            "faculty_id":
+                faculty_profile.faculty_id,
+            "semester_id":
+                semester_id,
         },
     ).mappings().all()
 
     return [
         {
-            "section_id": row["section_id"],
-            "section_name": row["section_name"],
-            "semester_id": row["semester_id"],
+            "section_id":
+                int(row["section_id"]),
+            "section_name":
+                row["section_name"],
+            "semester_id":
+                int(row["semester_id"]),
             "student_count": int(
                 row["student_count"] or 0
             ),

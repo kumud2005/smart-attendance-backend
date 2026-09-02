@@ -32,6 +32,20 @@ from app.schemas.admin import (
     AdminUserListItem,
     AdminUserDetailResponse,
     AdminUserStatusResponse,
+    AdminFacultyAssignmentCreate,
+    AdminFacultyAssignmentItem,
+    AdminFacultyAssignmentMutationResponse,
+    AdminFacultyAssignmentOptionsResponse,
+    AdminCreateAdminRequest,
+    AdminCreateAdminResponse,
+    AdminStudentRegistrationDecision,
+    AdminStudentRegistrationReviewItem,
+    AdminStudentRegistrationDecisionResponse,
+    AdminFacultyRegistrationDecision,
+    AdminFacultyRegistrationReviewItem,
+    AdminFacultyRegistrationDecisionResponse,
+    AdminStudentFaceStatusResponse,
+    AdminStudentFaceDeleteResponse,
 )
 
 from app.services.admin_report_export_service import (
@@ -46,6 +60,19 @@ from app.services.admin_service import (
     get_user_details,
     change_account_status,
     get_admin_attendance_report,
+    get_faculty_assignment_options,
+    list_faculty_assignments,
+    create_faculty_assignment,
+    deactivate_faculty_assignment,
+    create_admin_account,
+    list_student_registration_requests,
+    approve_student_registration,
+    reject_student_registration,
+    list_faculty_registration_requests,
+    approve_faculty_registration,
+    reject_faculty_registration,
+    get_student_face_status_for_admin,
+    delete_student_face_profile_for_admin,
 )
 
 
@@ -74,6 +101,272 @@ def dashboard(
 ):
     return get_dashboard_statistics(
         db=db
+    )
+
+
+
+
+
+
+
+# ============================================================
+# CREATE ANOTHER ADMIN
+# ============================================================
+
+@router.post(
+    "/admins",
+    response_model=AdminCreateAdminResponse,
+    status_code=201,
+    summary="Create Another Administrator Account",
+)
+def create_another_admin(
+    request: AdminCreateAdminRequest,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_admin_account(
+        db=db,
+        data=request,
+    )
+
+
+# ============================================================
+# STUDENT PUBLIC REGISTRATION REQUESTS
+# ============================================================
+
+@router.get(
+    "/student-registration-requests",
+    response_model=list[AdminStudentRegistrationReviewItem],
+    summary="Review Student Registration Requests",
+)
+def student_registration_requests(
+    request_status: str = "PENDING",
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_student_registration_requests(
+        db=db,
+        request_status=request_status,
+    )
+
+
+@router.patch(
+    "/student-registration-requests/{user_id}/approve",
+    response_model=AdminStudentRegistrationDecisionResponse,
+    summary="Approve Student Registration and Assign Section",
+)
+def approve_student_registration_request(
+    user_id: int,
+    request: AdminStudentRegistrationDecision,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return approve_student_registration(
+        db=db,
+        user_id=user_id,
+        current_admin=current_admin,
+        note=request.note,
+    )
+
+
+@router.patch(
+    "/student-registration-requests/{user_id}/reject",
+    response_model=AdminStudentRegistrationDecisionResponse,
+    summary="Reject Student Registration",
+)
+def reject_student_registration_request(
+    user_id: int,
+    request: AdminStudentRegistrationDecision,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return reject_student_registration(
+        db=db,
+        user_id=user_id,
+        current_admin=current_admin,
+        note=request.note,
+    )
+
+
+# ============================================================
+# FACULTY PUBLIC REGISTRATION REQUESTS
+# ============================================================
+
+@router.get(
+    "/faculty-registration-requests",
+    response_model=list[AdminFacultyRegistrationReviewItem],
+    summary="Review Faculty Registration Requests",
+)
+def faculty_registration_requests(
+    request_status: str = "PENDING",
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_faculty_registration_requests(
+        db=db,
+        request_status=request_status,
+    )
+
+
+@router.patch(
+    "/faculty-registration-requests/{user_id}/approve",
+    response_model=AdminFacultyRegistrationDecisionResponse,
+    summary="Approve Faculty Registration and Requested Assignments",
+)
+def approve_faculty_registration_request(
+    user_id: int,
+    request: AdminFacultyRegistrationDecision,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return approve_faculty_registration(
+        db=db,
+        user_id=user_id,
+        current_admin=current_admin,
+        note=request.note,
+    )
+
+
+@router.patch(
+    "/faculty-registration-requests/{user_id}/reject",
+    response_model=AdminFacultyRegistrationDecisionResponse,
+    summary="Reject Faculty Registration",
+)
+def reject_faculty_registration_request(
+    user_id: int,
+    request: AdminFacultyRegistrationDecision,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return reject_faculty_registration(
+        db=db,
+        user_id=user_id,
+        current_admin=current_admin,
+        note=request.note,
+    )
+
+
+# ============================================================
+# STUDENT FACE PROFILE MANAGEMENT
+# ============================================================
+
+@router.get(
+    "/students/{student_id}/face-profile",
+    response_model=AdminStudentFaceStatusResponse,
+    summary="Get Student Face Profile Status",
+)
+def student_face_profile_status(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return get_student_face_status_for_admin(
+        db=db,
+        student_id=student_id,
+    )
+
+
+@router.delete(
+    "/students/{student_id}/face-profile",
+    response_model=AdminStudentFaceDeleteResponse,
+    summary="Delete or Reset Student Face Profile",
+)
+def delete_student_face_profile(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return delete_student_face_profile_for_admin(
+        db=db,
+        student_id=student_id,
+    )
+
+
+# ============================================================
+# FACULTY ASSIGNMENT OPTIONS
+# ============================================================
+
+@router.get(
+    "/faculty-assignments/options",
+    response_model=AdminFacultyAssignmentOptionsResponse,
+    summary="Get Faculty Assignment Form Options",
+)
+def faculty_assignment_options(
+    semester_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return get_faculty_assignment_options(
+        db=db,
+        semester_id=semester_id,
+    )
+
+
+# ============================================================
+# LIST FACULTY ASSIGNMENTS
+# ============================================================
+
+@router.get(
+    "/faculty-assignments",
+    response_model=list[AdminFacultyAssignmentItem],
+    summary="List Faculty Academic Assignments",
+)
+def faculty_assignments(
+    faculty_id: int | None = None,
+    semester_id: int | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_faculty_assignments(
+        db=db,
+        faculty_id=faculty_id,
+        semester_id=semester_id,
+        active_only=active_only,
+    )
+
+
+# ============================================================
+# CREATE / REACTIVATE FACULTY ASSIGNMENT
+# ============================================================
+
+@router.post(
+    "/faculty-assignments",
+    response_model=AdminFacultyAssignmentMutationResponse,
+    status_code=201,
+    summary="Assign Semester, Section and Subject to Faculty",
+)
+def assign_faculty_academic_scope(
+    request: AdminFacultyAssignmentCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_faculty_assignment(
+        db=db,
+        faculty_id=request.faculty_id,
+        semester_id=request.semester_id,
+        section_id=request.section_id,
+        subject_id=request.subject_id,
+    )
+
+
+# ============================================================
+# DEACTIVATE FACULTY ASSIGNMENT
+# ============================================================
+
+@router.patch(
+    "/faculty-assignments/{assignment_id}/deactivate",
+    response_model=AdminFacultyAssignmentMutationResponse,
+    summary="Remove Faculty Academic Assignment",
+)
+def remove_faculty_academic_scope(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return deactivate_faculty_assignment(
+        db=db,
+        assignment_id=assignment_id,
     )
 
 

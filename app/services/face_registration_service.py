@@ -224,7 +224,7 @@ def _prepare_embedding(
 
 
 # ============================================================
-# REGISTER / UPDATE STUDENT FACE
+# REGISTER STUDENT FACE
 # ============================================================
 
 def register_student_face(
@@ -235,8 +235,10 @@ def register_student_face(
     model_name: str,
 ) -> dict:
     """
-    Register or replace the authenticated student's
-    locally-generated face embedding.
+    Register the authenticated student's locally-generated face embedding.
+
+    Existing face profiles cannot be replaced by the Student. An Admin
+    must delete/reset the old face profile first.
 
     No face photograph is uploaded.
 
@@ -308,134 +310,61 @@ def register_student_face(
     ).mappings().first()
 
     # --------------------------------------------------------
-    # 4. INSERT OR UPDATE
+    # 4. BLOCK STUDENT-SIDE REPLACEMENT
+    # --------------------------------------------------------
+
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A face profile is already registered for this student. "
+                "Contact an administrator to reset/delete the existing "
+                "face profile before registering again."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # 5. INSERT NEW FACE PROFILE
     # --------------------------------------------------------
 
     try:
-        if existing is None:
-            result = db.execute(
-                text(
-                    """
-                    INSERT INTO student_face_profiles (
-                        student_id,
-                        face_embedding,
-                        embedding_model,
-                        embedding_dimensions,
-                        is_verified,
-                        is_active,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (
-                        :student_id,
-                        :face_embedding,
-                        :embedding_model,
-                        :embedding_dimensions,
-                        1,
-                        1,
-                        :created_at,
-                        :updated_at
-                    )
-                    """
-                ),
-                {
-                    "student_id":
-                        student_id,
-
-                    "face_embedding":
-                        embedding_json,
-
-                    "embedding_model":
-                        _FACE_MODEL_NAME,
-
-                    "embedding_dimensions":
-                        _FACE_EMBEDDING_DIMENSIONS,
-
-                    "created_at":
-                        now,
-
-                    "updated_at":
-                        now,
-                },
-            )
-
-            face_profile_id = int(
-                result.lastrowid
-            )
-
-        else:
-            face_profile_id = int(
-                existing[
-                    "face_profile_id"
-                ]
-            )
-
-            result = db.execute(
-                text(
-                    """
-                    UPDATE student_face_profiles
-
-                    SET
-                        face_embedding =
-                            :face_embedding,
-
-                        embedding_model =
-                            :embedding_model,
-
-                        embedding_dimensions =
-                            :embedding_dimensions,
-
-                        is_verified = 1,
-
-                        is_active = 1,
-
-                        updated_at =
-                            :updated_at
-
-                    WHERE
-                        face_profile_id =
-                            :face_profile_id
-
-                        AND student_id =
-                            :student_id
-                    """
-                ),
-                {
-                    "face_profile_id":
-                        face_profile_id,
-
-                    "student_id":
-                        student_id,
-
-                    "face_embedding":
-                        embedding_json,
-
-                    "embedding_model":
-                        _FACE_MODEL_NAME,
-
-                    "embedding_dimensions":
-                        _FACE_EMBEDDING_DIMENSIONS,
-
-                    "updated_at":
-                        now,
-                },
-            )
-
-            if result.rowcount != 1:
-                db.rollback()
-
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Face profile could not be "
-                        "updated because its state changed."
-                    ),
+        result = db.execute(
+            text(
+                """
+                INSERT INTO student_face_profiles (
+                    student_id,
+                    face_embedding,
+                    embedding_model,
+                    embedding_dimensions,
+                    is_verified,
+                    is_active,
+                    created_at,
+                    updated_at
                 )
+                VALUES (
+                    :student_id,
+                    :face_embedding,
+                    :embedding_model,
+                    :embedding_dimensions,
+                    1,
+                    1,
+                    :created_at,
+                    :updated_at
+                )
+                """
+            ),
+            {
+                "student_id": student_id,
+                "face_embedding": embedding_json,
+                "embedding_model": _FACE_MODEL_NAME,
+                "embedding_dimensions": _FACE_EMBEDDING_DIMENSIONS,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
 
+        face_profile_id = int(result.lastrowid)
         db.commit()
-
-    except HTTPException:
-        raise
 
     except Exception as exc:
         db.rollback()
@@ -449,7 +378,7 @@ def register_student_face(
         )
 
     # --------------------------------------------------------
-    # 5. FETCH SAVED PROFILE
+    # 6. FETCH SAVED PROFILE
     # --------------------------------------------------------
 
     row = db.execute(
@@ -496,7 +425,7 @@ def register_student_face(
         )
 
     # --------------------------------------------------------
-    # 6. RESPONSE
+    # 7. RESPONSE
     # --------------------------------------------------------
 
     return {
@@ -646,7 +575,7 @@ def get_student_face_status(
 
     return {
         "registered":
-            is_active,
+            True,
 
         "face_profile_id":
             int(

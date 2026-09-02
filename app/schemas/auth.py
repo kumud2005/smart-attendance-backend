@@ -14,15 +14,35 @@ from pydantic import (
 
 
 # ============================================================
+# FACULTY REGISTRATION ASSIGNMENT REQUEST
+# ============================================================
+
+class FacultyRegistrationAssignmentRequest(BaseModel):
+    """
+    One Semester + Section + Subject combination requested by
+    a Faculty member during public registration.
+
+    This is only a request. It does not become an active teaching
+    assignment until an administrator approves the registration.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    semester_id: int = Field(..., gt=0)
+    section_id: int = Field(..., gt=0)
+    subject_id: int = Field(..., gt=0)
+
+
+# ============================================================
 # REGISTER
 # ============================================================
 
 class RegisterRequest(BaseModel):
     """
-    Request body used by Admin, Faculty and Student registration.
+    Public registration request.
 
-    Role-specific fields are optional at schema level because
-    validation is performed according to role.
+    Public registration supports only STUDENT and FACULTY.
+    Administrator accounts are created by an authenticated Admin.
     """
 
     model_config = ConfigDict(
@@ -55,17 +75,13 @@ class RegisterRequest(BaseModel):
     )
 
     # --------------------------------------------------------
-    # ADMIN / FACULTY
+    # FACULTY
     # --------------------------------------------------------
 
     employee_id: str | None = Field(
         default=None,
         max_length=50
     )
-
-    # --------------------------------------------------------
-    # FACULTY
-    # --------------------------------------------------------
 
     department: str | None = Field(
         default=None,
@@ -76,6 +92,10 @@ class RegisterRequest(BaseModel):
         default=None,
         max_length=100
     )
+
+    faculty_assignments: list[
+        FacultyRegistrationAssignmentRequest
+    ] = Field(default_factory=list)
 
     # --------------------------------------------------------
     # STUDENT
@@ -93,6 +113,11 @@ class RegisterRequest(BaseModel):
 
     date_of_birth: date | None = None
 
+    # Student selects the requested Section during registration.
+    # Semester is derived from the selected Section and is shown in
+    # the registration UI through /api/auth/registration-options.
+    student_section_id: int | None = Field(default=None, gt=0)
+
     # --------------------------------------------------------
     # NORMALIZE ROLE
     # --------------------------------------------------------
@@ -100,7 +125,6 @@ class RegisterRequest(BaseModel):
     @field_validator("role_name")
     @classmethod
     def normalize_role(cls, value: str) -> str:
-
         return value.strip().upper()
 
     # --------------------------------------------------------
@@ -110,7 +134,6 @@ class RegisterRequest(BaseModel):
     @field_validator("email")
     @classmethod
     def normalize_email(cls, value: EmailStr) -> str:
-
         return str(value).strip().lower()
 
 
@@ -119,13 +142,22 @@ class RegisterRequest(BaseModel):
 # ============================================================
 
 class RegisterResponse(BaseModel):
-
     user_id: int
     role_name: str
     email: str
     full_name: str
     account_status: str
     message: str
+
+
+# ============================================================
+# REGISTRATION OPTIONS
+# ============================================================
+
+class RegistrationOptionsResponse(BaseModel):
+    semesters: list[dict]
+    sections: list[dict]
+    subjects: list[dict]
 
 
 # ============================================================
@@ -149,14 +181,9 @@ class LoginRequest(BaseModel):
         max_length=128
     )
 
-    # --------------------------------------------------------
-    # NORMALIZE EMAIL
-    # --------------------------------------------------------
-
     @field_validator("email")
     @classmethod
     def normalize_email(cls, value: EmailStr) -> str:
-
         return str(value).strip().lower()
 
 
@@ -165,7 +192,6 @@ class LoginRequest(BaseModel):
 # ============================================================
 
 class LoginResponse(BaseModel):
-
     access_token: str
     token_type: str
 

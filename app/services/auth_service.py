@@ -2,37 +2,26 @@
 Authentication and Registration Service
 ========================================
 
-This module handles:
+Public registration supports STUDENT and FACULTY accounts.
+Administrator accounts are created only by an authenticated Admin.
 
-1. Password hashing
-2. Password verification
-3. User registration
-4. User login
-5. JWT access-token generation
-6. Role validation
-7. Duplicate email checking
-8. Role-specific profile creation
-
-Supported roles:
-
-    ADMIN
-    FACULTY
-    STUDENT
-
-Password hashing uses bcrypt directly.
+Student public registration stores the requested Section in
+student_section_registration_requests. Faculty public registration
+stores requested Semester + Section + Subject combinations in
+faculty_assignment_requests. All requests remain PENDING until an
+administrator approves them.
 """
 
 import bcrypt
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token
 
 from app.models.role import Role
 from app.models.user import User
-from app.models.admin_profile import AdminProfile
 from app.models.faculty_profile import FacultyProfile
 from app.models.student_profile import StudentProfile
 
@@ -42,16 +31,11 @@ from app.models.student_profile import StudentProfile
 # ============================================================
 
 def hash_password(password: str) -> str:
-    """
-    Hash a plain-text password using bcrypt.
-
-    bcrypt has a maximum password size of 72 bytes.
-    """
+    """Hash a plain-text password using bcrypt."""
 
     password_bytes = password.encode("utf-8")
 
     if len(password_bytes) > 72:
-
         raise ValueError(
             "Password cannot be longer than 72 bytes."
         )
@@ -72,16 +56,12 @@ def verify_password(
     password: str,
     password_hash: str
 ) -> bool:
-    """
-    Verify a plain-text password against a bcrypt hash.
-    """
+    """Verify a plain-text password against a bcrypt hash."""
 
     try:
-
         password_bytes = password.encode("utf-8")
         hash_bytes = password_hash.encode("utf-8")
 
-        # bcrypt cannot process passwords over 72 bytes
         if len(password_bytes) > 72:
             return False
 
@@ -91,8 +71,246 @@ def verify_password(
         )
 
     except (ValueError, TypeError):
-
         return False
+
+
+# ============================================================
+# REGISTRATION OPTIONS
+# ============================================================
+
+def get_registration_options(
+    db: Session,
+    semester_id: int | None = None,
+) -> dict:
+    """
+    Public academic options used by the Faculty registration form.
+
+    No user or faculty information is exposed here.
+    """
+
+    semesters = db.execute(
+        text(
+            """
+            SELECT
+                semester_id,
+                semester_number,
+                semester_name
+            FROM semesters
+            ORDER BY semester_number, semester_id
+            """
+        )
+    ).mappings().all()
+
+    section_where = "sec.is_active = 1"
+    subject_where = "s.is_active = 1"
+    params: dict = {}
+
+    if semester_id is not None:
+        section_where += " AND sec.semester_id = :semester_id"
+        subject_where += " AND s.semester_id = :semester_id"
+        params["semester_id"] = semester_id
+
+    sections = db.execute(
+        text(
+            f"""
+            SELECT
+                sec.section_id,
+                sec.section_name,
+                sec.semester_id
+            FROM sections sec
+            WHERE {section_where}
+            ORDER BY sec.semester_id, sec.section_name
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    subjects = db.execute(
+        text(
+            f"""
+            SELECT
+                s.subject_id,
+                s.subject_code,
+                s.subject_name,
+                s.semester_id
+            FROM subjects s
+            WHERE {subject_where}
+            ORDER BY s.semester_id, s.subject_code, s.subject_name
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    return {
+        "semesters": [
+            {
+                "semester_id": int(row["semester_id"]),
+                "semester_number": row["semester_number"],
+                "semester_name": row["semester_name"],
+            }
+            for row in semesters
+        ],
+        "sections": [
+            {
+                "section_id": int(row["section_id"]),
+                "section_name": row["section_name"],
+                "semester_id": int(row["semester_id"]),
+            }
+            for row in sections
+        ],
+        "subjects": [
+            {
+                "subject_id": int(row["subject_id"]),
+                "subject_code": row["subject_code"],
+                "subject_name": row["subject_name"],
+                "semester_id": int(row["semester_id"]),
+            }
+            for row in subjects
+        ],
+    }
+
+
+# ============================================================
+# VALIDATE FACULTY REQUESTED ASSIGNMENT
+# ============================================================
+
+def _validate_faculty_requested_assignment(
+    db: Session,
+    semester_id: int,
+    section_id: int,
+    subject_id: int,
+) -> None:
+    semester_exists = db.execute(
+        text(
+            """
+            SELECT semester_id
+            FROM semesters
+            WHERE semester_id = :semester_id
+            LIMIT 1
+            """
+        ),
+        {"semester_id": semester_id},
+    ).scalar()
+
+    if semester_exists is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected semester does not exist.",
+        )
+
+    section = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                semester_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": section_id},
+    ).mappings().first()
+
+    if section is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected section does not exist.",
+        )
+
+    if not bool(section["is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected section is inactive.",
+        )
+
+    if int(section["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected section does not belong to "
+                "the selected semester."
+            ),
+        )
+
+    subject = db.execute(
+        text(
+            """
+            SELECT
+                subject_id,
+                semester_id,
+                is_active
+            FROM subjects
+            WHERE subject_id = :subject_id
+            LIMIT 1
+            """
+        ),
+        {"subject_id": subject_id},
+    ).mappings().first()
+
+    if subject is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected subject does not exist.",
+        )
+
+    if not bool(subject["is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected subject is inactive.",
+        )
+
+    if int(subject["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected subject does not belong to "
+                "the selected semester."
+            ),
+        )
+
+
+# ============================================================
+# VALIDATE STUDENT REQUESTED SECTION
+# ============================================================
+
+def _validate_student_requested_section(
+    db: Session,
+    section_id: int,
+) -> None:
+    section = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                semester_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": section_id},
+    ).mappings().first()
+
+    if section is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected section does not exist.",
+        )
+
+    if not bool(section["is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected section is inactive.",
+        )
+
+    if section["semester_id"] is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Selected section has no semester configured.",
+        )
 
 
 # ============================================================
@@ -104,34 +322,36 @@ def register_user(
     data
 ):
     """
-    Register a new ADMIN, FACULTY, or STUDENT.
-    """
+    Register a new STUDENT or FACULTY account.
 
-    # --------------------------------------------------------
-    # 1. NORMALIZE ROLE
-    # --------------------------------------------------------
+    New accounts always start as PENDING.
+    """
 
     role_name = data.role_name.strip().upper()
 
+    if role_name == "ADMIN":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Administrator accounts cannot be created through "
+                "public registration. An existing administrator must "
+                "create the account."
+            ),
+        )
+
     allowed_roles = {
-        "ADMIN",
         "FACULTY",
-        "STUDENT"
+        "STUDENT",
     }
 
     if role_name not in allowed_roles:
-
         raise HTTPException(
             status_code=400,
             detail=(
-                "Invalid role. "
-                "Allowed roles: ADMIN, FACULTY, STUDENT"
-            )
+                "Invalid role. Allowed public registration roles: "
+                "FACULTY, STUDENT."
+            ),
         )
-
-    # --------------------------------------------------------
-    # 2. FIND ROLE
-    # --------------------------------------------------------
 
     role = db.scalar(
         select(Role).where(
@@ -140,15 +360,10 @@ def register_user(
     )
 
     if role is None:
-
         raise HTTPException(
             status_code=400,
             detail=f"Role '{role_name}' does not exist."
         )
-
-    # --------------------------------------------------------
-    # 3. CHECK DUPLICATE EMAIL
-    # --------------------------------------------------------
 
     email = data.email.strip().lower()
 
@@ -159,34 +374,89 @@ def register_user(
     )
 
     if existing_user is not None:
-
         raise HTTPException(
             status_code=409,
-            detail=(
-                "An account with this email already exists."
-            )
+            detail="An account with this email already exists.",
         )
 
-    # --------------------------------------------------------
-    # 4. HASH PASSWORD
-    # --------------------------------------------------------
+    # Validate Faculty requests before creating any user/profile row.
+    faculty_requests = list(
+        getattr(data, "faculty_assignments", []) or []
+    )
+
+    if role_name == "FACULTY":
+        if not data.employee_id:
+            raise HTTPException(
+                status_code=400,
+                detail="employee_id is required for FACULTY registration.",
+            )
+
+        if not faculty_requests:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "At least one Semester, Section and Subject "
+                    "assignment request is required for Faculty registration."
+                ),
+            )
+
+        seen: set[tuple[int, int, int]] = set()
+
+        for item in faculty_requests:
+            key = (
+                int(item.semester_id),
+                int(item.section_id),
+                int(item.subject_id),
+            )
+
+            if key in seen:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Duplicate Faculty assignment request detected."
+                    ),
+                )
+
+            seen.add(key)
+
+            _validate_faculty_requested_assignment(
+                db=db,
+                semester_id=key[0],
+                section_id=key[1],
+                subject_id=key[2],
+            )
+
+    if role_name == "STUDENT":
+        if not data.enrollment_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "enrollment_number is required for STUDENT registration."
+                ),
+            )
+
+        if data.student_section_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "student_section_id is required for STUDENT registration."
+                ),
+            )
+
+        _validate_student_requested_section(
+            db=db,
+            section_id=int(data.student_section_id),
+        )
 
     try:
-
         password_hash = hash_password(
             data.password
         )
-
     except ValueError as exc:
-
         raise HTTPException(
             status_code=400,
             detail=str(exc)
         )
-
-    # --------------------------------------------------------
-    # 5. CREATE USER
-    # --------------------------------------------------------
 
     user = User(
         role_id=role.role_id,
@@ -201,134 +471,126 @@ def register_user(
         account_status="PENDING"
     )
 
-    db.add(user)
-
-    # Generate user_id before creating profile.
-    db.flush()
-
-    # --------------------------------------------------------
-    # 6. CREATE ADMIN PROFILE
-    # --------------------------------------------------------
-
-    if role_name == "ADMIN":
-
-        if not data.employee_id:
-
-            db.rollback()
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "employee_id is required "
-                    "for ADMIN registration."
-                )
-            )
-
-        profile = AdminProfile(
-            user_id=user.user_id,
-            employee_id=data.employee_id.strip(),
-            designation=(
-                data.designation.strip()
-                if data.designation
-                else None
-            )
-        )
-
-        db.add(profile)
-
-    # --------------------------------------------------------
-    # 7. CREATE FACULTY PROFILE
-    # --------------------------------------------------------
-
-    elif role_name == "FACULTY":
-
-        if not data.employee_id:
-
-            db.rollback()
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "employee_id is required "
-                    "for FACULTY registration."
-                )
-            )
-
-        profile = FacultyProfile(
-            user_id=user.user_id,
-            employee_id=data.employee_id.strip(),
-            department=(
-                data.department.strip()
-                if data.department
-                else None
-            ),
-            designation=(
-                data.designation.strip()
-                if data.designation
-                else None
-            )
-        )
-
-        db.add(profile)
-
-    # --------------------------------------------------------
-    # 8. CREATE STUDENT PROFILE
-    # --------------------------------------------------------
-
-    elif role_name == "STUDENT":
-
-        if not data.enrollment_number:
-
-            db.rollback()
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "enrollment_number is required "
-                    "for STUDENT registration."
-                )
-            )
-
-        profile = StudentProfile(
-            user_id=user.user_id,
-            enrollment_number=data.enrollment_number.strip(),
-            roll_number=(
-                data.roll_number.strip()
-                if data.roll_number
-                else None
-            ),
-            date_of_birth=data.date_of_birth
-        )
-
-        db.add(profile)
-
-    # --------------------------------------------------------
-    # 9. COMMIT REGISTRATION
-    # --------------------------------------------------------
-
     try:
+        db.add(user)
+        db.flush()
+
+        if role_name == "FACULTY":
+            profile = FacultyProfile(
+                user_id=user.user_id,
+                employee_id=data.employee_id.strip(),
+                department=(
+                    data.department.strip()
+                    if data.department
+                    else None
+                ),
+                designation=(
+                    data.designation.strip()
+                    if data.designation
+                    else None
+                )
+            )
+
+            db.add(profile)
+            db.flush()
+
+            for item in faculty_requests:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO faculty_assignment_requests (
+                            faculty_id,
+                            semester_id,
+                            section_id,
+                            subject_id,
+                            request_status
+                        )
+                        VALUES (
+                            :faculty_id,
+                            :semester_id,
+                            :section_id,
+                            :subject_id,
+                            'PENDING'
+                        )
+                        """
+                    ),
+                    {
+                        "faculty_id": int(profile.faculty_id),
+                        "semester_id": int(item.semester_id),
+                        "section_id": int(item.section_id),
+                        "subject_id": int(item.subject_id),
+                    },
+                )
+
+        elif role_name == "STUDENT":
+            profile = StudentProfile(
+                user_id=user.user_id,
+                enrollment_number=data.enrollment_number.strip(),
+                roll_number=(
+                    data.roll_number.strip()
+                    if data.roll_number
+                    else None
+                ),
+                date_of_birth=data.date_of_birth
+            )
+
+            db.add(profile)
+            db.flush()
+
+            db.execute(
+                text(
+                    """
+                    INSERT INTO student_section_registration_requests (
+                        student_id,
+                        section_id,
+                        request_status
+                    )
+                    VALUES (
+                        :student_id,
+                        :section_id,
+                        'PENDING'
+                    )
+                    """
+                ),
+                {
+                    "student_id": int(profile.student_id),
+                    "section_id": int(data.student_section_id),
+                },
+            )
 
         db.commit()
-
         db.refresh(user)
 
-    except Exception as exc:
+    except HTTPException:
+        db.rollback()
+        raise
 
+    except Exception as exc:
         db.rollback()
 
         error_message = str(exc)
 
-        if (
-            "Duplicate entry" in error_message
-            or "uq_users_email" in error_message
-        ):
-
+        if "Duplicate entry" in error_message:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "A record with the supplied "
-                    "unique value already exists."
-                )
+                    "A record with the supplied unique value already exists."
+                ),
+            )
+
+        if (
+            "faculty_assignment_requests" in error_message
+            or "student_section_registration_requests" in error_message
+        ) and (
+            "doesn't exist" in error_message
+            or "does not exist" in error_message
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Registration request storage is not installed. "
+                    "Run the supplied database migration first."
+                ),
             )
 
         raise HTTPException(
@@ -336,8 +598,8 @@ def register_user(
             detail={
                 "status": "error",
                 "message": "Registration failed.",
-                "error": error_message
-            }
+                "error": error_message,
+            },
         )
 
     return user

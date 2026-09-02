@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models.user import User
 from app.models.role import Role
+from app.models.admin_profile import AdminProfile
+from app.services.auth_service import hash_password
 
 
 # ============================================================
@@ -446,6 +448,80 @@ def change_account_status(
         user.account_status
     )
 
+    # Faculty public registrations must be approved through the
+    # dedicated Faculty-registration workflow so that requested
+    # Semester + Section + Subject combinations are verified and
+    # activated atomically with the account.
+    target_role_name = ""
+
+    if user.role is not None:
+        target_role_name = str(user.role.role_name)
+
+        if "." in target_role_name:
+            target_role_name = target_role_name.split(".")[-1]
+
+        target_role_name = target_role_name.upper()
+
+    if (
+        normalized_status == "ACTIVE"
+        and previous_status == "PENDING"
+        and target_role_name == "FACULTY"
+    ):
+        pending_faculty_request = db.execute(
+            text(
+                """
+                SELECT far.request_id
+                FROM faculty_assignment_requests far
+                INNER JOIN faculty_profiles fp
+                    ON fp.faculty_id = far.faculty_id
+                WHERE fp.user_id = :user_id
+                  AND far.request_status = 'PENDING'
+                LIMIT 1
+                """
+            ),
+            {"user_id": target_user_id},
+        ).scalar()
+
+        if pending_faculty_request is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Pending Faculty registrations must be approved "
+                    "through the Faculty registration review endpoint so "
+                    "their requested academic assignments are verified."
+                ),
+            )
+
+    if (
+        normalized_status == "ACTIVE"
+        and previous_status == "PENDING"
+        and target_role_name == "STUDENT"
+    ):
+        pending_student_request = db.execute(
+            text(
+                """
+                SELECT ssrr.request_id
+                FROM student_section_registration_requests ssrr
+                INNER JOIN student_profiles sp
+                    ON sp.student_id = ssrr.student_id
+                WHERE sp.user_id = :user_id
+                  AND ssrr.request_status = 'PENDING'
+                LIMIT 1
+                """
+            ),
+            {"user_id": target_user_id},
+        ).scalar()
+
+        if pending_student_request is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Pending Student registrations must be approved "
+                    "through the Student registration review endpoint so "
+                    "the requested Section is verified and assigned."
+                ),
+            )
+
     # --------------------------------------------------------
     # NO-OP CHECK
     # --------------------------------------------------------
@@ -533,6 +609,1882 @@ def change_account_status(
         "account_status": normalized_status,
         "message": messages[normalized_status],
     }
+
+
+# ============================================================
+# FACULTY ASSIGNMENT MANAGEMENT
+# ============================================================
+
+def get_faculty_assignment_options(
+    db: Session,
+    semester_id: int | None = None,
+) -> dict:
+    """
+    Return values used by the Admin Faculty Assignment form.
+
+    Sections and subjects are optionally limited to one semester so
+    the Flutter form can use dependent Semester -> Section/Subject
+    dropdowns without hard-coded academic data.
+    """
+
+    faculty_rows = db.execute(
+        text(
+            """
+            SELECT
+                fp.faculty_id,
+                fp.employee_id,
+                fp.department,
+                fp.designation,
+                u.full_name,
+                u.email,
+                u.account_status
+            FROM faculty_profiles fp
+            INNER JOIN users u
+                ON u.user_id = fp.user_id
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            WHERE r.role_name = 'FACULTY'
+              AND u.account_status = 'ACTIVE'
+            ORDER BY u.full_name, fp.employee_id
+            """
+        )
+    ).mappings().all()
+
+    semester_rows = db.execute(
+        text(
+            """
+            SELECT
+                semester_id,
+                semester_number,
+                semester_name
+            FROM semesters
+            ORDER BY semester_number, semester_id
+            """
+        )
+    ).mappings().all()
+
+    section_params: dict = {}
+    section_where = "sec.is_active = 1"
+
+    subject_params: dict = {}
+    subject_where = "s.is_active = 1"
+
+    if semester_id is not None:
+        section_where += " AND sec.semester_id = :semester_id"
+        subject_where += " AND s.semester_id = :semester_id"
+
+        section_params["semester_id"] = semester_id
+        subject_params["semester_id"] = semester_id
+
+    section_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                sec.section_id,
+                sec.section_name,
+                sec.semester_id
+            FROM sections sec
+            WHERE {section_where}
+            ORDER BY sec.semester_id, sec.section_name
+            """
+        ),
+        section_params,
+    ).mappings().all()
+
+    subject_rows = db.execute(
+        text(
+            f"""
+            SELECT
+                s.subject_id,
+                s.subject_code,
+                s.subject_name,
+                s.credits,
+                s.semester_id
+            FROM subjects s
+            WHERE {subject_where}
+            ORDER BY s.semester_id, s.subject_code, s.subject_name
+            """
+        ),
+        subject_params,
+    ).mappings().all()
+
+    return {
+        "faculties": [
+            {
+                "faculty_id": int(row["faculty_id"]),
+                "employee_id": row["employee_id"],
+                "full_name": row["full_name"],
+                "email": row["email"],
+                "department": row["department"],
+                "designation": row["designation"],
+                "account_status": _normalize_status(
+                    row["account_status"]
+                ),
+            }
+            for row in faculty_rows
+        ],
+        "semesters": [
+            {
+                "semester_id": int(row["semester_id"]),
+                "semester_number": row["semester_number"],
+                "semester_name": row["semester_name"],
+            }
+            for row in semester_rows
+        ],
+        "sections": [
+            {
+                "section_id": int(row["section_id"]),
+                "section_name": row["section_name"],
+                "semester_id": int(row["semester_id"]),
+            }
+            for row in section_rows
+        ],
+        "subjects": [
+            {
+                "subject_id": int(row["subject_id"]),
+                "subject_code": row["subject_code"],
+                "subject_name": row["subject_name"],
+                "credits": (
+                    float(row["credits"])
+                    if row["credits"] is not None
+                    else None
+                ),
+                "semester_id": int(row["semester_id"]),
+            }
+            for row in subject_rows
+        ],
+    }
+
+
+def _faculty_assignment_select_sql() -> str:
+    return """
+        SELECT
+            fsa.assignment_id,
+
+            fp.faculty_id,
+            fp.employee_id,
+            fu.full_name AS faculty_name,
+
+            sem.semester_id,
+            sem.semester_number,
+            sem.semester_name,
+
+            sec.section_id,
+            sec.section_name,
+
+            s.subject_id,
+            s.subject_code,
+            s.subject_name,
+
+            fsa.is_active
+
+        FROM faculty_subject_assignments fsa
+
+        INNER JOIN faculty_profiles fp
+            ON fp.faculty_id = fsa.faculty_id
+
+        INNER JOIN users fu
+            ON fu.user_id = fp.user_id
+
+        INNER JOIN sections sec
+            ON sec.section_id = fsa.section_id
+
+        INNER JOIN semesters sem
+            ON sem.semester_id = sec.semester_id
+
+        INNER JOIN subjects s
+            ON s.subject_id = fsa.subject_id
+    """
+
+
+def _faculty_assignment_row_to_dict(
+    row,
+    message: str | None = None,
+) -> dict:
+    result = {
+        "assignment_id": int(row["assignment_id"]),
+
+        "faculty_id": int(row["faculty_id"]),
+        "faculty_name": row["faculty_name"],
+        "employee_id": row["employee_id"],
+
+        "semester_id": int(row["semester_id"]),
+        "semester_number": row["semester_number"],
+        "semester_name": row["semester_name"],
+
+        "section_id": int(row["section_id"]),
+        "section_name": row["section_name"],
+
+        "subject_id": int(row["subject_id"]),
+        "subject_code": row["subject_code"],
+        "subject_name": row["subject_name"],
+
+        "is_active": bool(row["is_active"]),
+    }
+
+    if message is not None:
+        result["message"] = message
+
+    return result
+
+
+def list_faculty_assignments(
+    db: Session,
+    faculty_id: int | None = None,
+    semester_id: int | None = None,
+    active_only: bool = False,
+) -> list[dict]:
+    conditions: list[str] = []
+    params: dict = {}
+
+    if faculty_id is not None:
+        conditions.append(
+            "fsa.faculty_id = :faculty_id"
+        )
+        params["faculty_id"] = faculty_id
+
+    if semester_id is not None:
+        conditions.append(
+            "sec.semester_id = :semester_id"
+        )
+        params["semester_id"] = semester_id
+
+    if active_only:
+        conditions.append(
+            "fsa.is_active = 1"
+        )
+
+    where_sql = ""
+
+    if conditions:
+        where_sql = (
+            " WHERE "
+            + " AND ".join(conditions)
+        )
+
+    rows = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + where_sql
+            + """
+              ORDER BY
+                fu.full_name,
+                sem.semester_number,
+                sec.section_name,
+                s.subject_code,
+                fsa.assignment_id
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    return [
+        _faculty_assignment_row_to_dict(row)
+        for row in rows
+    ]
+
+
+def create_faculty_assignment(
+    db: Session,
+    faculty_id: int,
+    semester_id: int,
+    section_id: int,
+    subject_id: int,
+) -> dict:
+    """
+    Assign one active Semester + Section + Subject combination
+    to one active Faculty member.
+
+    Semester is validated through both the section and subject.
+    The existing faculty_subject_assignments table remains the
+    source of truth, so no attendance-history table is changed.
+    """
+
+    faculty = db.execute(
+        text(
+            """
+            SELECT
+                fp.faculty_id,
+                fp.employee_id,
+                u.full_name,
+                u.account_status,
+                r.role_name
+            FROM faculty_profiles fp
+            INNER JOIN users u
+                ON u.user_id = fp.user_id
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            WHERE fp.faculty_id = :faculty_id
+            LIMIT 1
+            """
+        ),
+        {
+            "faculty_id": faculty_id,
+        },
+    ).mappings().first()
+
+    if faculty is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Faculty profile not found.",
+        )
+
+    if str(faculty["role_name"]).upper() != "FACULTY":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected user is not a faculty member.",
+        )
+
+    if _normalize_status(
+        faculty["account_status"]
+    ) != "ACTIVE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Faculty account must be ACTIVE before "
+                "academic assignments can be created."
+            ),
+        )
+
+    section = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                section_name,
+                semester_id,
+                academic_year_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {
+            "section_id": section_id,
+        },
+    ).mappings().first()
+
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Section not found.",
+        )
+
+    if not bool(section["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Selected section is inactive.",
+        )
+
+    if int(section["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected section does not belong to "
+                "the selected semester."
+            ),
+        )
+
+    if section["academic_year_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Selected section does not have an academic year "
+                "configured."
+            ),
+        )
+
+    academic_year_id = int(
+        section["academic_year_id"]
+    )
+
+    subject = db.execute(
+        text(
+            """
+            SELECT
+                subject_id,
+                subject_code,
+                subject_name,
+                semester_id,
+                is_active
+            FROM subjects
+            WHERE subject_id = :subject_id
+            LIMIT 1
+            """
+        ),
+        {
+            "subject_id": subject_id,
+        },
+    ).mappings().first()
+
+    if subject is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subject not found.",
+        )
+
+    if not bool(subject["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Selected subject is inactive.",
+        )
+
+    if int(subject["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected subject does not belong to "
+                "the selected semester."
+            ),
+        )
+
+    semester_exists = db.execute(
+        text(
+            """
+            SELECT semester_id
+            FROM semesters
+            WHERE semester_id = :semester_id
+            LIMIT 1
+            """
+        ),
+        {
+            "semester_id": semester_id,
+        },
+    ).scalar()
+
+    if semester_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Semester not found.",
+        )
+
+    existing = db.execute(
+        text(
+            """
+            SELECT
+                assignment_id,
+                is_active
+            FROM faculty_subject_assignments
+            WHERE faculty_id = :faculty_id
+              AND subject_id = :subject_id
+              AND section_id = :section_id
+              AND academic_year_id = :academic_year_id
+            ORDER BY assignment_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "faculty_id": faculty_id,
+            "subject_id": subject_id,
+            "section_id": section_id,
+            "academic_year_id": academic_year_id,
+        },
+    ).mappings().first()
+
+    if (
+        existing is not None
+        and bool(existing["is_active"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This faculty already has the selected "
+                "semester, section and subject assignment."
+            ),
+        )
+
+    try:
+        if existing is not None:
+            assignment_id = int(
+                existing["assignment_id"]
+            )
+
+            db.execute(
+                text(
+                    """
+                    UPDATE faculty_subject_assignments
+                    SET is_active = 1
+                    WHERE assignment_id = :assignment_id
+                    """
+                ),
+                {
+                    "assignment_id": assignment_id,
+                },
+            )
+
+            action_message = (
+                "Faculty assignment reactivated successfully."
+            )
+        else:
+            result = db.execute(
+                text(
+                    """
+                    INSERT INTO faculty_subject_assignments (
+                        faculty_id,
+                        subject_id,
+                        section_id,
+                        academic_year_id,
+                        is_active
+                    )
+                    VALUES (
+                        :faculty_id,
+                        :subject_id,
+                        :section_id,
+                        :academic_year_id,
+                        1
+                    )
+                    """
+                ),
+                {
+                    "faculty_id": faculty_id,
+                    "subject_id": subject_id,
+                    "section_id": section_id,
+                    "academic_year_id": academic_year_id,
+                },
+            )
+
+            assignment_id = int(
+                result.lastrowid
+            )
+
+            action_message = (
+                "Faculty assignment created successfully."
+            )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    row = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {
+            "assignment_id": assignment_id,
+        },
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Faculty assignment was saved but "
+                "could not be retrieved."
+            ),
+        )
+
+    return _faculty_assignment_row_to_dict(
+        row,
+        message=action_message,
+    )
+
+
+def deactivate_faculty_assignment(
+    db: Session,
+    assignment_id: int,
+) -> dict:
+    row = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {
+            "assignment_id": assignment_id,
+        },
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Faculty assignment not found.",
+        )
+
+    if not bool(row["is_active"]):
+        return _faculty_assignment_row_to_dict(
+            row,
+            message="Faculty assignment is already inactive.",
+        )
+
+    active_session = db.execute(
+        text(
+            """
+            SELECT session_id
+            FROM attendance_sessions
+            WHERE faculty_id = :faculty_id
+              AND subject_id = :subject_id
+              AND section_id = :section_id
+              AND session_status = 'ACTIVE'
+            LIMIT 1
+            """
+        ),
+        {
+            "faculty_id": int(row["faculty_id"]),
+            "subject_id": int(row["subject_id"]),
+            "section_id": int(row["section_id"]),
+        },
+    ).scalar()
+
+    if active_session is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This assignment has an ACTIVE attendance "
+                "session. Complete or cancel that session "
+                "before removing the assignment."
+            ),
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE faculty_subject_assignments
+                SET is_active = 0
+                WHERE assignment_id = :assignment_id
+                """
+            ),
+            {
+                "assignment_id": assignment_id,
+            },
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    updated = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {
+            "assignment_id": assignment_id,
+        },
+    ).mappings().first()
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Faculty assignment was updated but "
+                "could not be retrieved."
+            ),
+        )
+
+    return _faculty_assignment_row_to_dict(
+        updated,
+        message="Faculty assignment removed successfully.",
+    )
+
+
+
+
+
+# ============================================================
+# CREATE ANOTHER ADMIN ACCOUNT
+# ============================================================
+
+def create_admin_account(
+    db: Session,
+    data,
+) -> dict:
+    """Create an ACTIVE administrator account from an Admin-only API."""
+
+    email = str(data.email).strip().lower()
+    employee_id = data.employee_id.strip()
+
+    existing_email = db.scalar(
+        select(User).where(User.email == email)
+    )
+
+    if existing_email is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists.",
+        )
+
+    existing_employee_id = db.execute(
+        text(
+            """
+            SELECT admin_id
+            FROM admin_profiles
+            WHERE employee_id = :employee_id
+            LIMIT 1
+            """
+        ),
+        {"employee_id": employee_id},
+    ).scalar()
+
+    if existing_employee_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An Admin with this employee_id already exists.",
+        )
+
+    admin_role = db.scalar(
+        select(Role).where(Role.role_name == "ADMIN")
+    )
+
+    if admin_role is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ADMIN role is not configured.",
+        )
+
+    try:
+        password_hash = hash_password(data.password)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    user = User(
+        role_id=admin_role.role_id,
+        email=email,
+        password_hash=password_hash,
+        full_name=data.full_name.strip(),
+        phone=(data.phone.strip() if data.phone else None),
+        account_status="ACTIVE",
+    )
+
+    try:
+        db.add(user)
+        db.flush()
+
+        profile = AdminProfile(
+            user_id=user.user_id,
+            employee_id=employee_id,
+            designation=(
+                data.designation.strip()
+                if data.designation
+                else None
+            ),
+        )
+
+        db.add(profile)
+        db.commit()
+        db.refresh(user)
+        db.refresh(profile)
+
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unable to create Admin account: {exc}",
+        )
+
+    return {
+        "user_id": int(user.user_id),
+        "admin_id": int(profile.admin_id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "employee_id": profile.employee_id,
+        "account_status": _normalize_status(user.account_status),
+        "message": "Administrator account created successfully.",
+    }
+
+
+# ============================================================
+# STUDENT REGISTRATION REVIEW
+# ============================================================
+
+def _validate_student_registration_section(
+    db: Session,
+    section_id: int,
+) -> dict:
+    section = db.execute(
+        text(
+            """
+            SELECT
+                sec.section_id,
+                sec.section_name,
+                sec.semester_id,
+                sec.is_active,
+                sem.semester_number,
+                sem.semester_name
+            FROM sections sec
+            LEFT JOIN semesters sem
+                ON sem.semester_id = sec.semester_id
+            WHERE sec.section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": section_id},
+    ).mappings().first()
+
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Requested Student section no longer exists.",
+        )
+
+    if not bool(section["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Requested Student section is inactive.",
+        )
+
+    if section["semester_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Requested Student section has no semester configured.",
+        )
+
+    return dict(section)
+
+
+def list_student_registration_requests(
+    db: Session,
+    request_status: str = "PENDING",
+) -> list[dict]:
+    normalized = request_status.strip().upper()
+
+    if normalized not in {"PENDING", "APPROVED", "REJECTED", "ALL"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "request_status must be PENDING, APPROVED, REJECTED or ALL."
+            ),
+        )
+
+    where_request = ""
+    params: dict = {}
+
+    if normalized != "ALL":
+        where_request = " AND ssrr.request_status = :request_status"
+        params["request_status"] = normalized
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                ssrr.request_id,
+                u.user_id,
+                sp.student_id,
+                u.email,
+                u.full_name,
+                u.phone,
+                sp.enrollment_number,
+                sp.roll_number,
+                sp.date_of_birth,
+                u.account_status,
+                u.created_at,
+
+                ssrr.section_id,
+                sec.section_name,
+                sec.semester_id,
+                sem.semester_number,
+                sem.semester_name,
+
+                ssrr.request_status,
+                ssrr.requested_at,
+                ssrr.reviewed_at,
+                ssrr.reviewed_by_user_id,
+                ssrr.review_note
+
+            FROM student_section_registration_requests ssrr
+            INNER JOIN student_profiles sp
+                ON sp.student_id = ssrr.student_id
+            INNER JOIN users u
+                ON u.user_id = sp.user_id
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN sections sec
+                ON sec.section_id = ssrr.section_id
+            LEFT JOIN semesters sem
+                ON sem.semester_id = sec.semester_id
+
+            WHERE r.role_name = 'STUDENT'
+              {where_request}
+
+            ORDER BY u.created_at DESC, ssrr.request_id DESC
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    return [
+        {
+            "request_id": int(row["request_id"]),
+            "user_id": int(row["user_id"]),
+            "student_id": int(row["student_id"]),
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "phone": row["phone"],
+            "enrollment_number": row["enrollment_number"],
+            "roll_number": row["roll_number"],
+            "date_of_birth": row["date_of_birth"],
+            "account_status": _normalize_status(row["account_status"]),
+            "created_at": row["created_at"],
+            "section_id": int(row["section_id"]),
+            "section_name": row["section_name"],
+            "semester_id": int(row["semester_id"]),
+            "semester_number": row["semester_number"],
+            "semester_name": row["semester_name"],
+            "request_status": str(row["request_status"]).upper(),
+            "requested_at": row["requested_at"],
+            "reviewed_at": row["reviewed_at"],
+            "reviewed_by_user_id": row["reviewed_by_user_id"],
+            "review_note": row["review_note"],
+        }
+        for row in rows
+    ]
+
+
+def approve_student_registration(
+    db: Session,
+    user_id: int,
+    current_admin: User,
+    note: str | None = None,
+) -> dict:
+    student = db.execute(
+        text(
+            """
+            SELECT
+                u.user_id,
+                u.email,
+                u.full_name,
+                u.account_status,
+                r.role_name,
+                sp.student_id,
+                ssrr.request_id,
+                ssrr.section_id,
+                ssrr.request_status
+            FROM users u
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN student_profiles sp
+                ON sp.user_id = u.user_id
+            INNER JOIN student_section_registration_requests ssrr
+                ON ssrr.student_id = sp.student_id
+            WHERE u.user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+
+    if student is None or str(student["role_name"]).upper() != "STUDENT":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending Student registration not found.",
+        )
+
+    if _normalize_status(student["account_status"]) != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only a PENDING Student registration can be approved.",
+        )
+
+    if str(student["request_status"]).upper() != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Student Section request is not PENDING.",
+        )
+
+    student_id = int(student["student_id"])
+    section_id = int(student["section_id"])
+    section = _validate_student_registration_section(
+        db=db,
+        section_id=section_id,
+    )
+
+    try:
+        # A student should have only one active current Section.
+        db.execute(
+            text(
+                """
+                UPDATE student_section_assignments
+                SET is_active = 0
+                WHERE student_id = :student_id
+                  AND is_active = 1
+                """
+            ),
+            {"student_id": student_id},
+        )
+
+        existing_assignment = db.execute(
+            text(
+                """
+                SELECT assignment_id
+                FROM student_section_assignments
+                WHERE student_id = :student_id
+                  AND section_id = :section_id
+                LIMIT 1
+                """
+            ),
+            {
+                "student_id": student_id,
+                "section_id": section_id,
+            },
+        ).scalar()
+
+        if existing_assignment is None:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO student_section_assignments (
+                        student_id,
+                        section_id,
+                        is_active
+                    )
+                    VALUES (
+                        :student_id,
+                        :section_id,
+                        1
+                    )
+                    """
+                ),
+                {
+                    "student_id": student_id,
+                    "section_id": section_id,
+                },
+            )
+        else:
+            db.execute(
+                text(
+                    """
+                    UPDATE student_section_assignments
+                    SET is_active = 1,
+                        assigned_at = CURRENT_TIMESTAMP
+                    WHERE assignment_id = :assignment_id
+                    """
+                ),
+                {"assignment_id": int(existing_assignment)},
+            )
+
+        db.execute(
+            text(
+                """
+                UPDATE student_section_registration_requests
+                SET
+                    request_status = 'APPROVED',
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    reviewed_by_user_id = :reviewed_by_user_id,
+                    review_note = :review_note
+                WHERE request_id = :request_id
+                  AND request_status = 'PENDING'
+                """
+            ),
+            {
+                "request_id": int(student["request_id"]),
+                "reviewed_by_user_id": current_admin.user_id,
+                "review_note": note.strip() if note else None,
+            },
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE users
+                SET account_status = 'ACTIVE'
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "user_id": int(student["user_id"]),
+        "student_id": student_id,
+        "email": student["email"],
+        "full_name": student["full_name"],
+        "account_status": "ACTIVE",
+        "section_id": section_id,
+        "section_name": section["section_name"],
+        "message": (
+            "Student registration approved and Section assigned successfully."
+        ),
+    }
+
+
+def reject_student_registration(
+    db: Session,
+    user_id: int,
+    current_admin: User,
+    note: str | None = None,
+) -> dict:
+    student = db.execute(
+        text(
+            """
+            SELECT
+                u.user_id,
+                u.email,
+                u.full_name,
+                u.account_status,
+                r.role_name,
+                sp.student_id,
+                ssrr.request_id,
+                ssrr.section_id,
+                ssrr.request_status,
+                sec.section_name
+            FROM users u
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN student_profiles sp
+                ON sp.user_id = u.user_id
+            INNER JOIN student_section_registration_requests ssrr
+                ON ssrr.student_id = sp.student_id
+            INNER JOIN sections sec
+                ON sec.section_id = ssrr.section_id
+            WHERE u.user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+
+    if student is None or str(student["role_name"]).upper() != "STUDENT":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending Student registration not found.",
+        )
+
+    if _normalize_status(student["account_status"]) != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only a PENDING Student registration can be rejected.",
+        )
+
+    if str(student["request_status"]).upper() != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Student Section request is not PENDING.",
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE student_section_registration_requests
+                SET
+                    request_status = 'REJECTED',
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    reviewed_by_user_id = :reviewed_by_user_id,
+                    review_note = :review_note
+                WHERE request_id = :request_id
+                  AND request_status = 'PENDING'
+                """
+            ),
+            {
+                "request_id": int(student["request_id"]),
+                "reviewed_by_user_id": current_admin.user_id,
+                "review_note": note.strip() if note else None,
+            },
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE users
+                SET account_status = 'INACTIVE'
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "user_id": int(student["user_id"]),
+        "student_id": int(student["student_id"]),
+        "email": student["email"],
+        "full_name": student["full_name"],
+        "account_status": "INACTIVE",
+        "section_id": int(student["section_id"]),
+        "section_name": student["section_name"],
+        "message": "Student registration rejected.",
+    }
+
+
+# ============================================================
+# FACULTY REGISTRATION REVIEW HELPERS
+# ============================================================
+
+def _validate_faculty_registration_request_scope(
+    db: Session,
+    semester_id: int,
+    section_id: int,
+    subject_id: int,
+) -> int:
+    """Validate one requested scope and return its academic_year_id."""
+
+    section = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                semester_id,
+                academic_year_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": section_id},
+    ).mappings().first()
+
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A requested section no longer exists.",
+        )
+
+    if not bool(section["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A requested section is inactive.",
+        )
+
+    if int(section["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A requested section no longer belongs to the "
+                "requested semester."
+            ),
+        )
+
+    if section["academic_year_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A requested section has no academic year configured.",
+        )
+
+    subject = db.execute(
+        text(
+            """
+            SELECT
+                subject_id,
+                semester_id,
+                is_active
+            FROM subjects
+            WHERE subject_id = :subject_id
+            LIMIT 1
+            """
+        ),
+        {"subject_id": subject_id},
+    ).mappings().first()
+
+    if subject is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A requested subject no longer exists.",
+        )
+
+    if not bool(subject["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A requested subject is inactive.",
+        )
+
+    if int(subject["semester_id"]) != semester_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A requested subject no longer belongs to the "
+                "requested semester."
+            ),
+        )
+
+    return int(section["academic_year_id"])
+
+
+def list_faculty_registration_requests(
+    db: Session,
+    request_status: str = "PENDING",
+) -> list[dict]:
+    """Return Faculty registrations and their requested assignments."""
+
+    normalized = request_status.strip().upper()
+
+    if normalized not in {"PENDING", "APPROVED", "REJECTED", "ALL"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "request_status must be PENDING, APPROVED, REJECTED or ALL."
+            ),
+        )
+
+    where_request = ""
+    params: dict = {}
+
+    if normalized != "ALL":
+        where_request = " AND far.request_status = :request_status"
+        params["request_status"] = normalized
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                u.user_id,
+                u.email,
+                u.full_name,
+                u.phone,
+                u.account_status,
+                u.created_at,
+
+                fp.faculty_id,
+                fp.employee_id,
+                fp.department,
+                fp.designation,
+
+                far.request_id,
+                far.semester_id,
+                sem.semester_number,
+                sem.semester_name,
+                far.section_id,
+                sec.section_name,
+                far.subject_id,
+                s.subject_code,
+                s.subject_name,
+                far.request_status,
+                far.requested_at,
+                far.reviewed_at,
+                far.reviewed_by_user_id,
+                far.review_note
+
+            FROM users u
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN faculty_profiles fp
+                ON fp.user_id = u.user_id
+            INNER JOIN faculty_assignment_requests far
+                ON far.faculty_id = fp.faculty_id
+            INNER JOIN semesters sem
+                ON sem.semester_id = far.semester_id
+            INNER JOIN sections sec
+                ON sec.section_id = far.section_id
+            INNER JOIN subjects s
+                ON s.subject_id = far.subject_id
+
+            WHERE r.role_name = 'FACULTY'
+              {where_request}
+
+            ORDER BY
+                u.created_at DESC,
+                u.user_id DESC,
+                far.request_id ASC
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    grouped: dict[int, dict] = {}
+
+    for row in rows:
+        user_id = int(row["user_id"])
+
+        item = grouped.get(user_id)
+        if item is None:
+            item = {
+                "user_id": user_id,
+                "faculty_id": int(row["faculty_id"]),
+                "email": row["email"],
+                "full_name": row["full_name"],
+                "phone": row["phone"],
+                "employee_id": row["employee_id"],
+                "department": row["department"],
+                "designation": row["designation"],
+                "account_status": _normalize_status(row["account_status"]),
+                "created_at": row["created_at"],
+                "assignments": [],
+            }
+            grouped[user_id] = item
+
+        item["assignments"].append(
+            {
+                "request_id": int(row["request_id"]),
+                "semester_id": int(row["semester_id"]),
+                "semester_number": row["semester_number"],
+                "semester_name": row["semester_name"],
+                "section_id": int(row["section_id"]),
+                "section_name": row["section_name"],
+                "subject_id": int(row["subject_id"]),
+                "subject_code": row["subject_code"],
+                "subject_name": row["subject_name"],
+                "request_status": str(row["request_status"]),
+                "requested_at": row["requested_at"],
+                "reviewed_at": row["reviewed_at"],
+                "reviewed_by_user_id": (
+                    int(row["reviewed_by_user_id"])
+                    if row["reviewed_by_user_id"] is not None
+                    else None
+                ),
+                "review_note": row["review_note"],
+            }
+        )
+
+    return list(grouped.values())
+
+
+def approve_faculty_registration(
+    db: Session,
+    user_id: int,
+    current_admin: User,
+    note: str | None = None,
+) -> dict:
+    """
+    Activate a pending Faculty account and atomically convert every
+    PENDING registration assignment request into an active assignment.
+    """
+
+    faculty = db.execute(
+        text(
+            """
+            SELECT
+                u.user_id,
+                u.email,
+                u.full_name,
+                u.account_status,
+                r.role_name,
+                fp.faculty_id
+            FROM users u
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN faculty_profiles fp
+                ON fp.user_id = u.user_id
+            WHERE u.user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+
+    if faculty is None or str(faculty["role_name"]).upper() != "FACULTY":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending Faculty registration not found.",
+        )
+
+    if _normalize_status(faculty["account_status"]) != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only a PENDING Faculty registration can be approved.",
+        )
+
+    faculty_id = int(faculty["faculty_id"])
+
+    requests = db.execute(
+        text(
+            """
+            SELECT
+                request_id,
+                semester_id,
+                section_id,
+                subject_id
+            FROM faculty_assignment_requests
+            WHERE faculty_id = :faculty_id
+              AND request_status = 'PENDING'
+            ORDER BY request_id
+            """
+        ),
+        {"faculty_id": faculty_id},
+    ).mappings().all()
+
+    if not requests:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This Faculty registration has no pending academic "
+                "assignment requests to approve."
+            ),
+        )
+
+    validated: list[tuple[dict, int]] = []
+
+    # Validate every request before changing any database row.
+    for request in requests:
+        academic_year_id = _validate_faculty_registration_request_scope(
+            db=db,
+            semester_id=int(request["semester_id"]),
+            section_id=int(request["section_id"]),
+            subject_id=int(request["subject_id"]),
+        )
+        validated.append((request, academic_year_id))
+
+    try:
+        for request, academic_year_id in validated:
+            existing = db.execute(
+                text(
+                    """
+                    SELECT assignment_id
+                    FROM faculty_subject_assignments
+                    WHERE faculty_id = :faculty_id
+                      AND subject_id = :subject_id
+                      AND section_id = :section_id
+                      AND academic_year_id = :academic_year_id
+                    ORDER BY assignment_id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "faculty_id": faculty_id,
+                    "subject_id": int(request["subject_id"]),
+                    "section_id": int(request["section_id"]),
+                    "academic_year_id": academic_year_id,
+                },
+            ).scalar()
+
+            if existing is None:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO faculty_subject_assignments (
+                            faculty_id,
+                            subject_id,
+                            section_id,
+                            academic_year_id,
+                            is_active
+                        )
+                        VALUES (
+                            :faculty_id,
+                            :subject_id,
+                            :section_id,
+                            :academic_year_id,
+                            1
+                        )
+                        """
+                    ),
+                    {
+                        "faculty_id": faculty_id,
+                        "subject_id": int(request["subject_id"]),
+                        "section_id": int(request["section_id"]),
+                        "academic_year_id": academic_year_id,
+                    },
+                )
+            else:
+                db.execute(
+                    text(
+                        """
+                        UPDATE faculty_subject_assignments
+                        SET is_active = 1
+                        WHERE assignment_id = :assignment_id
+                        """
+                    ),
+                    {"assignment_id": int(existing)},
+                )
+
+        db.execute(
+            text(
+                """
+                UPDATE faculty_assignment_requests
+                SET
+                    request_status = 'APPROVED',
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    reviewed_by_user_id = :reviewed_by_user_id,
+                    review_note = :review_note
+                WHERE faculty_id = :faculty_id
+                  AND request_status = 'PENDING'
+                """
+            ),
+            {
+                "faculty_id": faculty_id,
+                "reviewed_by_user_id": current_admin.user_id,
+                "review_note": note.strip() if note else None,
+            },
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE users
+                SET account_status = 'ACTIVE'
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "user_id": int(faculty["user_id"]),
+        "faculty_id": faculty_id,
+        "email": faculty["email"],
+        "full_name": faculty["full_name"],
+        "account_status": "ACTIVE",
+        "processed_assignments": len(validated),
+        "message": (
+            "Faculty registration approved and academic assignments "
+            "activated successfully."
+        ),
+    }
+
+
+def reject_faculty_registration(
+    db: Session,
+    user_id: int,
+    current_admin: User,
+    note: str | None = None,
+) -> dict:
+    """Reject a pending Faculty registration without deleting history."""
+
+    faculty = db.execute(
+        text(
+            """
+            SELECT
+                u.user_id,
+                u.email,
+                u.full_name,
+                u.account_status,
+                r.role_name,
+                fp.faculty_id
+            FROM users u
+            INNER JOIN roles r
+                ON r.role_id = u.role_id
+            INNER JOIN faculty_profiles fp
+                ON fp.user_id = u.user_id
+            WHERE u.user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+
+    if faculty is None or str(faculty["role_name"]).upper() != "FACULTY":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pending Faculty registration not found.",
+        )
+
+    if _normalize_status(faculty["account_status"]) != "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only a PENDING Faculty registration can be rejected.",
+        )
+
+    faculty_id = int(faculty["faculty_id"])
+
+    try:
+        result = db.execute(
+            text(
+                """
+                UPDATE faculty_assignment_requests
+                SET
+                    request_status = 'REJECTED',
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    reviewed_by_user_id = :reviewed_by_user_id,
+                    review_note = :review_note
+                WHERE faculty_id = :faculty_id
+                  AND request_status = 'PENDING'
+                """
+            ),
+            {
+                "faculty_id": faculty_id,
+                "reviewed_by_user_id": current_admin.user_id,
+                "review_note": note.strip() if note else None,
+            },
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE users
+                SET account_status = 'INACTIVE'
+                WHERE user_id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "user_id": int(faculty["user_id"]),
+        "faculty_id": faculty_id,
+        "email": faculty["email"],
+        "full_name": faculty["full_name"],
+        "account_status": "INACTIVE",
+        "processed_assignments": int(result.rowcount or 0),
+        "message": "Faculty registration rejected.",
+    }
+
+
+# ============================================================
+# ADMIN STUDENT FACE MANAGEMENT
+# ============================================================
+
+def get_student_face_status_for_admin(
+    db: Session,
+    student_id: int,
+) -> dict:
+    """Return face metadata only. Never return the biometric embedding."""
+
+    row = db.execute(
+        text(
+            """
+            SELECT
+                u.user_id,
+                u.full_name,
+                sp.student_id,
+                sp.enrollment_number,
+
+                sfp.face_profile_id,
+                sfp.embedding_model,
+                sfp.embedding_dimensions,
+                sfp.is_verified,
+                sfp.is_active,
+                sfp.created_at AS face_created_at,
+                sfp.updated_at AS face_updated_at
+
+            FROM student_profiles sp
+            INNER JOIN users u
+                ON u.user_id = sp.user_id
+            LEFT JOIN student_face_profiles sfp
+                ON sfp.student_id = sp.student_id
+            WHERE sp.student_id = :student_id
+            LIMIT 1
+            """
+        ),
+        {"student_id": student_id},
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student profile not found.",
+        )
+
+    registered = row["face_profile_id"] is not None
+
+    return {
+        "user_id": int(row["user_id"]),
+        "student_id": int(row["student_id"]),
+        "full_name": row["full_name"],
+        "enrollment_number": row["enrollment_number"],
+        "registered": registered,
+        "face_profile_id": (
+            int(row["face_profile_id"])
+            if row["face_profile_id"] is not None
+            else None
+        ),
+        "embedding_model": row["embedding_model"],
+        "embedding_dimensions": (
+            int(row["embedding_dimensions"])
+            if row["embedding_dimensions"] is not None
+            else None
+        ),
+        "is_verified": bool(row["is_verified"]) if registered else False,
+        "is_active": bool(row["is_active"]) if registered else False,
+        "created_at": row["face_created_at"],
+        "updated_at": row["face_updated_at"],
+    }
+
+
+def delete_student_face_profile_for_admin(
+    db: Session,
+    student_id: int,
+) -> dict:
+    """
+    Permanently remove only the student's biometric face profile.
+
+    Student account, student profile and attendance history are untouched.
+    """
+
+    student_exists = db.execute(
+        text(
+            """
+            SELECT student_id
+            FROM student_profiles
+            WHERE student_id = :student_id
+            LIMIT 1
+            """
+        ),
+        {"student_id": student_id},
+    ).scalar()
+
+    if student_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student profile not found.",
+        )
+
+    face_profile_id = db.execute(
+        text(
+            """
+            SELECT face_profile_id
+            FROM student_face_profiles
+            WHERE student_id = :student_id
+            LIMIT 1
+            """
+        ),
+        {"student_id": student_id},
+    ).scalar()
+
+    if face_profile_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student face profile is not registered.",
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                DELETE FROM student_face_profiles
+                WHERE student_id = :student_id
+                  AND face_profile_id = :face_profile_id
+                """
+            ),
+            {
+                "student_id": student_id,
+                "face_profile_id": int(face_profile_id),
+            },
+        )
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "student_id": student_id,
+        "deleted_face_profile_id": int(face_profile_id),
+        "registered": False,
+        "message": (
+            "Student face profile deleted successfully. "
+            "The student may register a new face profile."
+        ),
+    }
+
+
 # ============================================================
 # ADMIN ATTENDANCE REPORT HELPERS
 # ============================================================

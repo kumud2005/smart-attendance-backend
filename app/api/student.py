@@ -257,7 +257,7 @@ def register_face(
     ),
 ):
     """
-    Register/update the student's face embedding.
+    Register the student's face embedding when no face profile exists.
 
     Flutter performs locally:
 
