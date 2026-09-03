@@ -10,6 +10,7 @@ the same functionality can later be reused by other interfaces.
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.user import User
@@ -1293,6 +1294,457 @@ def deactivate_faculty_assignment(
 
 
 
+
+
+# ============================================================
+# CLASSROOM MANAGEMENT
+# ============================================================
+
+def _classroom_row_to_dict(
+    row,
+    message: str | None = None,
+) -> dict:
+    result = {
+        "classroom_id": int(row["classroom_id"]),
+        "building_name": row["building_name"],
+        "room_number": row["room_number"],
+        "latitude": float(row["latitude"]),
+        "longitude": float(row["longitude"]),
+        "geofence_radius_meters": float(
+            row["geofence_radius_meters"]
+        ),
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+    }
+
+    if message is not None:
+        result["message"] = message
+
+    return result
+
+
+def _get_classroom_row(
+    db: Session,
+    classroom_id: int,
+):
+    row = db.execute(
+        text(
+            """
+            SELECT
+                classroom_id,
+                building_name,
+                room_number,
+                latitude,
+                longitude,
+                geofence_radius_meters,
+                is_active,
+                created_at
+            FROM classrooms
+            WHERE classroom_id = :classroom_id
+            LIMIT 1
+            """
+        ),
+        {"classroom_id": classroom_id},
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Classroom not found.",
+        )
+
+    return row
+
+
+def list_classrooms(
+    db: Session,
+    active_only: bool = False,
+) -> list[dict]:
+    where_sql = "WHERE is_active = 1" if active_only else ""
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+                classroom_id,
+                building_name,
+                room_number,
+                latitude,
+                longitude,
+                geofence_radius_meters,
+                is_active,
+                created_at
+            FROM classrooms
+            {where_sql}
+            ORDER BY building_name, room_number, classroom_id
+            """
+        )
+    ).mappings().all()
+
+    return [
+        _classroom_row_to_dict(row)
+        for row in rows
+    ]
+
+
+def create_classroom(
+    db: Session,
+    data,
+) -> dict:
+    building_name = data.building_name.strip()
+    room_number = data.room_number.strip()
+
+    existing = db.execute(
+        text(
+            """
+            SELECT classroom_id
+            FROM classrooms
+            WHERE building_name = :building_name
+              AND room_number = :room_number
+            LIMIT 1
+            """
+        ),
+        {
+            "building_name": building_name,
+            "room_number": room_number,
+        },
+    ).scalar()
+
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A classroom with this building name and "
+                "room number already exists."
+            ),
+        )
+
+    try:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO classrooms (
+                    building_name,
+                    room_number,
+                    latitude,
+                    longitude,
+                    geofence_radius_meters,
+                    is_active
+                )
+                VALUES (
+                    :building_name,
+                    :room_number,
+                    :latitude,
+                    :longitude,
+                    :geofence_radius_meters,
+                    :is_active
+                )
+                """
+            ),
+            {
+                "building_name": building_name,
+                "room_number": room_number,
+                "latitude": data.latitude,
+                "longitude": data.longitude,
+                "geofence_radius_meters": data.geofence_radius_meters,
+                "is_active": 1 if data.is_active else 0,
+            },
+        )
+
+        classroom_id = int(result.lastrowid)
+        db.commit()
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A classroom with this building name and "
+                "room number already exists."
+            ),
+        )
+    except Exception:
+        db.rollback()
+        raise
+
+    row = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    return _classroom_row_to_dict(
+        row,
+        message="Classroom created successfully.",
+    )
+
+
+def update_classroom(
+    db: Session,
+    classroom_id: int,
+    data,
+) -> dict:
+    current = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    values = data.model_dump(exclude_unset=True)
+
+    if not values:
+        return _classroom_row_to_dict(
+            current,
+            message="No classroom changes were provided.",
+        )
+
+    if "building_name" in values:
+        values["building_name"] = values["building_name"].strip()
+
+    if "room_number" in values:
+        values["room_number"] = values["room_number"].strip()
+
+    building_name = values.get(
+        "building_name",
+        current["building_name"],
+    )
+    room_number = values.get(
+        "room_number",
+        current["room_number"],
+    )
+
+    duplicate = db.execute(
+        text(
+            """
+            SELECT classroom_id
+            FROM classrooms
+            WHERE building_name = :building_name
+              AND room_number = :room_number
+              AND classroom_id <> :classroom_id
+            LIMIT 1
+            """
+        ),
+        {
+            "building_name": building_name,
+            "room_number": room_number,
+            "classroom_id": classroom_id,
+        },
+    ).scalar()
+
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Another classroom already uses this building "
+                "name and room number."
+            ),
+        )
+
+    allowed_fields = {
+        "building_name",
+        "room_number",
+        "latitude",
+        "longitude",
+        "geofence_radius_meters",
+    }
+
+    assignments = []
+    params = {"classroom_id": classroom_id}
+
+    for key, value in values.items():
+        if key not in allowed_fields:
+            continue
+        assignments.append(f"{key} = :{key}")
+        params[key] = value
+
+    if not assignments:
+        return _classroom_row_to_dict(
+            current,
+            message="No classroom changes were provided.",
+        )
+
+    try:
+        db.execute(
+            text(
+                "UPDATE classrooms SET "
+                + ", ".join(assignments)
+                + " WHERE classroom_id = :classroom_id"
+            ),
+            params,
+        )
+        db.commit()
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Another classroom already uses this building "
+                "name and room number."
+            ),
+        )
+    except Exception:
+        db.rollback()
+        raise
+
+    updated = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    return _classroom_row_to_dict(
+        updated,
+        message="Classroom updated successfully.",
+    )
+
+
+def set_classroom_active_status(
+    db: Session,
+    classroom_id: int,
+    is_active: bool,
+) -> dict:
+    current = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    desired = bool(is_active)
+
+    if bool(current["is_active"]) == desired:
+        return _classroom_row_to_dict(
+            current,
+            message=(
+                "Classroom is already active."
+                if desired
+                else "Classroom is already inactive."
+            ),
+        )
+
+    if not desired:
+        active_session = db.execute(
+            text(
+                """
+                SELECT session_id
+                FROM attendance_sessions
+                WHERE classroom_id = :classroom_id
+                  AND session_status = 'ACTIVE'
+                LIMIT 1
+                """
+            ),
+            {"classroom_id": classroom_id},
+        ).scalar()
+
+        if active_session is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This classroom has an ACTIVE attendance session. "
+                    "Complete or cancel that session before "
+                    "deactivating the classroom."
+                ),
+            )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE classrooms
+                SET is_active = :is_active
+                WHERE classroom_id = :classroom_id
+                """
+            ),
+            {
+                "is_active": 1 if desired else 0,
+                "classroom_id": classroom_id,
+            },
+        )
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    updated = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    return _classroom_row_to_dict(
+        updated,
+        message=(
+            "Classroom activated successfully."
+            if desired
+            else "Classroom deactivated successfully."
+        ),
+    )
+
+
+def delete_classroom(
+    db: Session,
+    classroom_id: int,
+) -> dict:
+    """
+    Permanently delete only a classroom that has never been used.
+
+    Any classroom referenced by attendance_sessions is preserved so
+    historical attendance and audit records remain intact. In that
+    situation the Admin should deactivate the classroom instead.
+    """
+    current = _get_classroom_row(
+        db=db,
+        classroom_id=classroom_id,
+    )
+
+    attendance_reference = db.execute(
+        text(
+            """
+            SELECT session_id
+            FROM attendance_sessions
+            WHERE classroom_id = :classroom_id
+            LIMIT 1
+            """
+        ),
+        {"classroom_id": classroom_id},
+    ).scalar()
+
+    if attendance_reference is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This classroom has attendance history or an attendance "
+                "session and cannot be permanently deleted. "
+                "Deactivate the classroom instead."
+            ),
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                DELETE FROM classrooms
+                WHERE classroom_id = :classroom_id
+                """
+            ),
+            {"classroom_id": classroom_id},
+        )
+        db.commit()
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This classroom is referenced by existing system records "
+                "and cannot be permanently deleted. "
+                "Deactivate the classroom instead."
+            ),
+        )
+    except Exception:
+        db.rollback()
+        raise
+
+    return _classroom_row_to_dict(
+        current,
+        message="Classroom deleted successfully.",
+    )
 
 
 # ============================================================

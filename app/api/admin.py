@@ -46,6 +46,10 @@ from app.schemas.admin import (
     AdminFacultyRegistrationDecisionResponse,
     AdminStudentFaceStatusResponse,
     AdminStudentFaceDeleteResponse,
+    AdminClassroomCreate,
+    AdminClassroomUpdate,
+    AdminClassroomItem,
+    AdminClassroomMutationResponse,
 )
 
 from app.services.admin_report_export_service import (
@@ -73,6 +77,11 @@ from app.services.admin_service import (
     reject_faculty_registration,
     get_student_face_status_for_admin,
     delete_student_face_profile_for_admin,
+    list_classrooms,
+    create_classroom,
+    update_classroom,
+    set_classroom_active_status,
+    delete_classroom,
 )
 
 
@@ -107,6 +116,111 @@ def dashboard(
 
 
 
+
+
+# ============================================================
+# CLASSROOM MANAGEMENT
+# ============================================================
+
+@router.get(
+    "/classrooms",
+    response_model=list[AdminClassroomItem],
+    summary="List Classrooms",
+)
+def classrooms(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_classrooms(
+        db=db,
+        active_only=active_only,
+    )
+
+
+@router.post(
+    "/classrooms",
+    response_model=AdminClassroomMutationResponse,
+    status_code=201,
+    summary="Create Classroom",
+)
+def add_classroom(
+    request: AdminClassroomCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_classroom(
+        db=db,
+        data=request,
+    )
+
+
+@router.patch(
+    "/classrooms/{classroom_id}",
+    response_model=AdminClassroomMutationResponse,
+    summary="Update Classroom",
+)
+def edit_classroom(
+    classroom_id: int,
+    request: AdminClassroomUpdate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return update_classroom(
+        db=db,
+        classroom_id=classroom_id,
+        data=request,
+    )
+
+
+@router.patch(
+    "/classrooms/{classroom_id}/activate",
+    response_model=AdminClassroomMutationResponse,
+    summary="Activate Classroom",
+)
+def activate_classroom(
+    classroom_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return set_classroom_active_status(
+        db=db,
+        classroom_id=classroom_id,
+        is_active=True,
+    )
+
+
+@router.patch(
+    "/classrooms/{classroom_id}/deactivate",
+    response_model=AdminClassroomMutationResponse,
+    summary="Deactivate Classroom",
+)
+def deactivate_classroom(
+    classroom_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return set_classroom_active_status(
+        db=db,
+        classroom_id=classroom_id,
+        is_active=False,
+    )
+
+
+@router.delete(
+    "/classrooms/{classroom_id}",
+    response_model=AdminClassroomMutationResponse,
+    summary="Delete Unused Classroom",
+)
+def remove_classroom(
+    classroom_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return delete_classroom(
+        db=db,
+        classroom_id=classroom_id,
+    )
 
 
 # ============================================================

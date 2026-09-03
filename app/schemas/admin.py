@@ -316,3 +316,43 @@ class AdminStudentFaceDeleteResponse(BaseModel):
     deleted_face_profile_id: int
     registered: bool
     message: str
+
+
+# ============================================================
+# CLASSROOM MANAGEMENT
+# ============================================================
+
+class AdminClassroomCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    building_name: str = Field(..., min_length=1, max_length=100)
+    room_number: str = Field(..., min_length=1, max_length=50)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    geofence_radius_meters: float = Field(default=50.0, ge=10, le=500)
+    is_active: bool = True
+
+
+class AdminClassroomUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    building_name: str | None = Field(default=None, min_length=1, max_length=100)
+    room_number: str | None = Field(default=None, min_length=1, max_length=50)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    geofence_radius_meters: float | None = Field(default=None, ge=10, le=500)
+
+
+class AdminClassroomItem(BaseModel):
+    classroom_id: int
+    building_name: str
+    room_number: str
+    latitude: float
+    longitude: float
+    geofence_radius_meters: float
+    is_active: bool
+    created_at: datetime
+
+
+class AdminClassroomMutationResponse(AdminClassroomItem):
+    message: str
