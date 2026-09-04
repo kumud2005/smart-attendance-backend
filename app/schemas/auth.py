@@ -3,6 +3,7 @@ Authentication request and response schemas.
 """
 
 from datetime import date
+import re
 
 from pydantic import (
     BaseModel,
@@ -135,6 +136,44 @@ class RegisterRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: EmailStr) -> str:
         return str(value).strip().lower()
+
+    # --------------------------------------------------------
+    # NORMALIZE FULL NAME
+    # --------------------------------------------------------
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_full_name(cls, value: str) -> str:
+        return " ".join(value.strip().split()).title()
+
+    # --------------------------------------------------------
+    # PASSWORD STRENGTH
+    # --------------------------------------------------------
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, value: str) -> str:
+        if not re.search(r"[A-Z]", value):
+            raise ValueError(
+                "Password must contain at least 1 uppercase letter."
+            )
+
+        if not re.search(r"[a-z]", value):
+            raise ValueError(
+                "Password must contain at least 1 lowercase letter."
+            )
+
+        if not re.search(r"[0-9]", value):
+            raise ValueError(
+                "Password must contain at least 1 number."
+            )
+
+        if not re.search(r"[^A-Za-z0-9]", value):
+            raise ValueError(
+                "Password must contain at least 1 special character."
+            )
+
+        return value
 
 
 # ============================================================

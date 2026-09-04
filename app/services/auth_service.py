@@ -366,6 +366,7 @@ def register_user(
         )
 
     email = data.email.strip().lower()
+    full_name = " ".join(data.full_name.strip().split()).title()
 
     existing_user = db.scalar(
         select(User).where(
@@ -462,7 +463,7 @@ def register_user(
         role_id=role.role_id,
         email=email,
         password_hash=password_hash,
-        full_name=data.full_name.strip(),
+        full_name=full_name,
         phone=(
             data.phone.strip()
             if data.phone
