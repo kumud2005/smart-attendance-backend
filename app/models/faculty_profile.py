@@ -42,6 +42,15 @@ class FacultyProfile(Base):
         nullable=True,
     )
 
+    # Authoritative academic branch. The legacy department text column is
+    # retained for backward compatibility with existing screens/reports.
+    # Program is derived through branches.program_id.
+    branch_id = Column(
+        Integer,
+        ForeignKey("branches.branch_id"),
+        nullable=True,
+    )
+
     designation = Column(
         String(100),
         nullable=True,

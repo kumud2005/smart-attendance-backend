@@ -32,6 +32,16 @@ from app.schemas.admin import (
     AdminUserListItem,
     AdminUserDetailResponse,
     AdminUserStatusResponse,
+    AdminProgramCreate,
+    AdminProgramItem,
+    AdminProgramMutationResponse,
+    AdminBranchCreate,
+    AdminBranchItem,
+    AdminBranchMutationResponse,
+    AdminSubjectCreate,
+    AdminSubjectItem,
+    AdminSubjectMutationResponse,
+    AdminSubjectOptionsResponse,
     AdminFacultyAssignmentCreate,
     AdminFacultyAssignmentItem,
     AdminFacultyAssignmentMutationResponse,
@@ -64,6 +74,19 @@ from app.services.admin_service import (
     get_user_details,
     change_account_status,
     get_admin_attendance_report,
+    list_programs,
+    create_program,
+    set_program_active_status,
+    delete_program,
+    list_branches,
+    create_branch,
+    set_branch_active_status,
+    delete_branch,
+    get_subject_management_options,
+    list_subjects,
+    create_subject,
+    set_subject_active_status,
+    delete_subject,
     get_faculty_assignment_options,
     list_faculty_assignments,
     create_faculty_assignment,
@@ -116,6 +139,91 @@ def dashboard(
 
 
 
+
+
+# ============================================================
+# ACADEMIC PROGRAM MANAGEMENT
+# ============================================================
+
+@router.get("/programs", response_model=list[AdminProgramItem], summary="List Academic Programs")
+def academic_programs(
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_programs(db=db, active_only=active_only)
+
+
+@router.post("/programs", response_model=AdminProgramMutationResponse, status_code=201, summary="Create Academic Program")
+def add_academic_program(
+    request: AdminProgramCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_program(
+        db=db,
+        program_code=request.program_code,
+        program_name=request.program_name,
+        description=request.description,
+    )
+
+
+@router.patch("/programs/{program_id}/activate", response_model=AdminProgramMutationResponse, summary="Activate Academic Program")
+def activate_academic_program(program_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return set_program_active_status(db=db, program_id=program_id, is_active=True)
+
+
+@router.patch("/programs/{program_id}/deactivate", response_model=AdminProgramMutationResponse, summary="Deactivate Academic Program")
+def deactivate_academic_program(program_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return set_program_active_status(db=db, program_id=program_id, is_active=False)
+
+
+@router.delete("/programs/{program_id}", response_model=AdminProgramMutationResponse, summary="Safely Delete Unused Academic Program")
+def remove_academic_program(program_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return delete_program(db=db, program_id=program_id)
+
+
+# ============================================================
+# COURSE / BRANCH MANAGEMENT
+# ============================================================
+
+@router.get("/branches", response_model=list[AdminBranchItem], summary="List Courses / Branches")
+def academic_branches(
+    program_id: int | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_branches(db=db, program_id=program_id, active_only=active_only)
+
+
+@router.post("/branches", response_model=AdminBranchMutationResponse, status_code=201, summary="Create Course / Branch")
+def add_academic_branch(
+    request: AdminBranchCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_branch(
+        db=db,
+        program_id=request.program_id,
+        branch_code=request.branch_code,
+        branch_name=request.branch_name,
+    )
+
+
+@router.patch("/branches/{branch_id}/activate", response_model=AdminBranchMutationResponse, summary="Activate Course / Branch")
+def activate_academic_branch(branch_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return set_branch_active_status(db=db, branch_id=branch_id, is_active=True)
+
+
+@router.patch("/branches/{branch_id}/deactivate", response_model=AdminBranchMutationResponse, summary="Deactivate Course / Branch")
+def deactivate_academic_branch(branch_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return set_branch_active_status(db=db, branch_id=branch_id, is_active=False)
+
+
+@router.delete("/branches/{branch_id}", response_model=AdminBranchMutationResponse, summary="Safely Delete Unused Course / Branch")
+def remove_academic_branch(branch_id: int, db: Session = Depends(get_db), current_admin: User = Depends(require_admin)):
+    return delete_branch(db=db, branch_id=branch_id)
 
 
 # ============================================================
@@ -393,6 +501,116 @@ def delete_student_face_profile(
     return delete_student_face_profile_for_admin(
         db=db,
         student_id=student_id,
+    )
+
+
+# ============================================================
+# ACADEMIC SUBJECT MANAGEMENT
+# ============================================================
+
+@router.get(
+    "/subjects/options",
+    response_model=AdminSubjectOptionsResponse,
+    summary="Get Subject Management Form Options",
+)
+def subject_management_options(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return get_subject_management_options(db=db)
+
+
+@router.get(
+    "/subjects",
+    response_model=list[AdminSubjectItem],
+    summary="List Subjects by Academic Scope",
+)
+def subjects(
+    program_id: int | None = None,
+    branch_id: int | None = None,
+    semester_id: int | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return list_subjects(
+        db=db,
+        program_id=program_id,
+        branch_id=branch_id,
+        semester_id=semester_id,
+        active_only=active_only,
+    )
+
+
+@router.post(
+    "/subjects",
+    response_model=AdminSubjectMutationResponse,
+    status_code=201,
+    summary="Add Subject to Program, Branch and Semester",
+)
+def add_subject(
+    request: AdminSubjectCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return create_subject(
+        db=db,
+        program_id=request.program_id,
+        branch_id=request.branch_id,
+        semester_id=request.semester_id,
+        subject_code=request.subject_code,
+        subject_name=request.subject_name,
+        credits=request.credits,
+    )
+
+
+@router.patch(
+    "/subjects/{subject_id}/activate",
+    response_model=AdminSubjectMutationResponse,
+    summary="Activate Subject",
+)
+def activate_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return set_subject_active_status(
+        db=db,
+        subject_id=subject_id,
+        is_active=True,
+    )
+
+
+@router.patch(
+    "/subjects/{subject_id}/deactivate",
+    response_model=AdminSubjectMutationResponse,
+    summary="Deactivate Subject",
+)
+def deactivate_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return set_subject_active_status(
+        db=db,
+        subject_id=subject_id,
+        is_active=False,
+    )
+
+
+@router.delete(
+    "/subjects/{subject_id}",
+    response_model=AdminSubjectMutationResponse,
+    summary="Safely Delete Unused Subject",
+)
+def remove_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    return delete_subject(
+        db=db,
+        subject_id=subject_id,
     )
 
 

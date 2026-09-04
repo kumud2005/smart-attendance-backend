@@ -88,6 +88,35 @@ def get_registration_options(
     No user or faculty information is exposed here.
     """
 
+    programs = db.execute(
+        text(
+            """
+            SELECT
+                program_id,
+                program_name,
+                program_code
+            FROM degree_programs
+            WHERE is_active = 1
+            ORDER BY program_name, program_id
+            """
+        )
+    ).mappings().all()
+
+    branches = db.execute(
+        text(
+            """
+            SELECT
+                branch_id,
+                program_id,
+                branch_name,
+                branch_code
+            FROM branches
+            WHERE is_active = 1
+            ORDER BY program_id, branch_name, branch_id
+            """
+        )
+    ).mappings().all()
+
     semesters = db.execute(
         text(
             """
@@ -142,6 +171,23 @@ def get_registration_options(
     ).mappings().all()
 
     return {
+        "programs": [
+            {
+                "program_id": int(row["program_id"]),
+                "program_name": row["program_name"],
+                "program_code": row["program_code"],
+            }
+            for row in programs
+        ],
+        "branches": [
+            {
+                "branch_id": int(row["branch_id"]),
+                "program_id": int(row["program_id"]),
+                "branch_name": row["branch_name"],
+                "branch_code": row["branch_code"],
+            }
+            for row in branches
+        ],
         "semesters": [
             {
                 "semester_id": int(row["semester_id"]),
@@ -168,6 +214,66 @@ def get_registration_options(
             for row in subjects
         ],
     }
+
+
+# ============================================================
+# VALIDATE PROGRAM + BRANCH
+# ============================================================
+
+def _get_registration_branch(
+    db: Session,
+    program_id: int,
+    branch_id: int,
+):
+    """Validate an active Program -> Branch selection and return its row."""
+
+    row = db.execute(
+        text(
+            """
+            SELECT
+                b.branch_id,
+                b.branch_name,
+                b.branch_code,
+                b.program_id,
+                b.is_active AS branch_is_active,
+                p.program_name,
+                p.program_code,
+                p.is_active AS program_is_active
+            FROM branches b
+            INNER JOIN degree_programs p
+                ON p.program_id = b.program_id
+            WHERE b.branch_id = :branch_id
+            LIMIT 1
+            """
+        ),
+        {"branch_id": branch_id},
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected department/branch does not exist.",
+        )
+
+    if int(row["program_id"]) != program_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected department does not belong to the selected program.",
+        )
+
+    if not bool(row["program_is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected program is inactive.",
+        )
+
+    if not bool(row["branch_is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected department is inactive.",
+        )
+
+    return row
 
 
 # ============================================================
@@ -380,6 +486,24 @@ def register_user(
             detail="An account with this email already exists.",
         )
 
+    if data.program_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="program_id is required for registration.",
+        )
+
+    if data.branch_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="branch_id is required for registration.",
+        )
+
+    academic_branch = _get_registration_branch(
+        db=db,
+        program_id=int(data.program_id),
+        branch_id=int(data.branch_id),
+    )
+
     # Validate Faculty requests before creating any user/profile row.
     faculty_requests = list(
         getattr(data, "faculty_assignments", []) or []
@@ -436,6 +560,26 @@ def register_user(
                 ),
             )
 
+        if not data.abc_id or not data.abc_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="abc_id is required for STUDENT registration.",
+            )
+
+        abc_id = data.abc_id.strip()
+
+        existing_abc_id = db.scalar(
+            select(StudentProfile.student_id).where(
+                StudentProfile.abc_id == abc_id
+            )
+        )
+
+        if existing_abc_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This ABC ID is already registered.",
+            )
+
         if data.student_section_id is None:
             raise HTTPException(
                 status_code=400,
@@ -480,11 +624,10 @@ def register_user(
             profile = FacultyProfile(
                 user_id=user.user_id,
                 employee_id=data.employee_id.strip(),
-                department=(
-                    data.department.strip()
-                    if data.department
-                    else None
-                ),
+                # Keep legacy department text synchronized for existing
+                # reports/screens while branch_id is the authoritative link.
+                department=str(academic_branch["branch_name"]).strip(),
+                branch_id=int(academic_branch["branch_id"]),
                 designation=(
                     data.designation.strip()
                     if data.designation
@@ -532,7 +675,9 @@ def register_user(
                     if data.roll_number
                     else None
                 ),
-                date_of_birth=data.date_of_birth
+                date_of_birth=data.date_of_birth,
+                branch_id=int(academic_branch["branch_id"]),
+                abc_id=abc_id,
             )
 
             db.add(profile)

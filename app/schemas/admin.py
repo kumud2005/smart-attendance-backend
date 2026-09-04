@@ -129,6 +129,101 @@ class AdminUserStatusResponse(BaseModel):
     message: str
 
 # ============================================================
+# ACADEMIC PROGRAM / COURSE-BRANCH MANAGEMENT
+# ============================================================
+
+class AdminProgramCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    program_code: str = Field(..., min_length=1, max_length=30)
+    program_name: str = Field(..., min_length=2, max_length=100)
+    description: str | None = Field(default=None, max_length=255)
+
+
+class AdminProgramItem(BaseModel):
+    program_id: int
+    program_code: str
+    program_name: str
+    description: str | None = None
+    is_active: bool
+
+
+class AdminProgramMutationResponse(AdminProgramItem):
+    message: str
+
+
+class AdminBranchCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    program_id: int = Field(..., gt=0)
+    branch_code: str = Field(..., min_length=1, max_length=30)
+    branch_name: str = Field(..., min_length=2, max_length=100)
+
+
+class AdminBranchItem(BaseModel):
+    branch_id: int
+    program_id: int
+    program_code: str
+    program_name: str
+    branch_code: str
+    branch_name: str
+    is_active: bool
+
+
+class AdminBranchMutationResponse(AdminBranchItem):
+    message: str
+
+
+# ============================================================
+# ACADEMIC SUBJECT MANAGEMENT
+# ============================================================
+
+class AdminSubjectCreate(BaseModel):
+    """Create one subject inside Program -> Branch -> Semester."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    program_id: int = Field(..., gt=0)
+    branch_id: int = Field(..., gt=0)
+    semester_id: int = Field(..., gt=0)
+
+    subject_code: str = Field(..., min_length=1, max_length=30)
+    subject_name: str = Field(..., min_length=2, max_length=150)
+    credits: float | None = Field(default=None, ge=0, le=30)
+
+
+class AdminSubjectItem(BaseModel):
+    subject_id: int
+
+    program_id: int
+    program_code: str
+    program_name: str
+
+    branch_id: int
+    branch_code: str
+    branch_name: str
+
+    semester_id: int
+    semester_number: int | None = None
+    semester_name: str | None = None
+
+    subject_code: str
+    subject_name: str
+    credits: float | None = None
+    is_active: bool
+
+
+class AdminSubjectMutationResponse(AdminSubjectItem):
+    message: str
+
+
+class AdminSubjectOptionsResponse(BaseModel):
+    programs: list[dict]
+    branches: list[dict]
+    semesters: list[dict]
+
+
+# ============================================================
 # FACULTY ASSIGNMENT MANAGEMENT
 # ============================================================
 

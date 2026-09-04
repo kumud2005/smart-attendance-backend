@@ -76,6 +76,17 @@ class RegisterRequest(BaseModel):
     )
 
     # --------------------------------------------------------
+    # ACADEMIC IDENTITY (STUDENT + FACULTY)
+    # --------------------------------------------------------
+
+    # Both values are required by the registration service for new public
+    # registrations. Program is submitted so the backend can verify that
+    # the selected branch actually belongs to it. Only branch_id is stored
+    # in the profile because branches.program_id already defines the program.
+    program_id: int | None = Field(default=None, gt=0)
+    branch_id: int | None = Field(default=None, gt=0)
+
+    # --------------------------------------------------------
     # FACULTY
     # --------------------------------------------------------
 
@@ -113,6 +124,11 @@ class RegisterRequest(BaseModel):
     )
 
     date_of_birth: date | None = None
+
+    abc_id: str | None = Field(
+        default=None,
+        max_length=20
+    )
 
     # Student selects the requested Section during registration.
     # Semester is derived from the selected Section and is shown in
@@ -194,6 +210,8 @@ class RegisterResponse(BaseModel):
 # ============================================================
 
 class RegistrationOptionsResponse(BaseModel):
+    programs: list[dict]
+    branches: list[dict]
     semesters: list[dict]
     sections: list[dict]
     subjects: list[dict]
