@@ -34,6 +34,18 @@ class AttendanceMarkResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+
+# ============================================================
+# ACTIVE / RESUMABLE ATTENDANCE ATTEMPT
+# ============================================================
+
+class AttendanceActiveAttemptResponse(BaseModel):
+    has_active_attempt: bool
+    attempt: AttendanceMarkResponse | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # ============================================================
 # GEOFENCE VERIFICATION
 # ============================================================

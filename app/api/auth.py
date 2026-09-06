@@ -9,12 +9,18 @@ from app.schemas.auth import (
     RegistrationOptionsResponse,
     LoginRequest,
     LoginResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
 )
 
 from app.services.auth_service import (
     register_user,
     get_registration_options,
     login_user,
+    request_password_reset,
+    confirm_password_reset,
 )
 
 
@@ -125,4 +131,54 @@ def login(
         full_name=result["full_name"],
         account_status=result["account_status"],
         message=result["message"],
+    )
+
+
+# ============================================================
+# PASSWORD RESET - REQUEST
+# ============================================================
+
+@router.post(
+    "/password-reset/request",
+    response_model=PasswordResetRequestResponse,
+    status_code=status.HTTP_200_OK,
+)
+def password_reset_request(
+    data: PasswordResetRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Start password reset.
+
+    Local development can explicitly enable a direct test-token bypass.
+    Production later will send verification through email/OTP instead.
+    """
+
+    return request_password_reset(
+        db=db,
+        email=str(data.email),
+    )
+
+
+# ============================================================
+# PASSWORD RESET - CONFIRM
+# ============================================================
+
+@router.post(
+    "/password-reset/confirm",
+    response_model=PasswordResetConfirmResponse,
+    status_code=status.HTTP_200_OK,
+)
+def password_reset_confirm(
+    data: PasswordResetConfirmRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Change the password using a valid short-lived reset token.
+    """
+
+    return confirm_password_reset(
+        db=db,
+        reset_token=data.reset_token,
+        new_password=data.new_password,
     )

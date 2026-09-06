@@ -261,3 +261,97 @@ class LoginResponse(BaseModel):
     account_status: str
 
     message: str
+
+
+# ============================================================
+# PASSWORD RESET - REQUEST
+# ============================================================
+
+class PasswordResetRequest(BaseModel):
+    """
+    Start a password-reset flow.
+
+    Current local-test mode:
+        registered email -> short-lived reset token
+
+    Future production mode:
+        registered email -> email/OTP verification -> reset token
+    """
+
+    model_config = ConfigDict(
+        extra="forbid"
+    )
+
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(
+        cls,
+        value: EmailStr,
+    ) -> str:
+        return str(value).strip().lower()
+
+
+class PasswordResetRequestResponse(BaseModel):
+    message: str
+
+    # Returned ONLY while the explicit local test bypass is enabled.
+    test_reset_token: str | None = None
+
+    expires_in_minutes: int | None = None
+
+    test_mode: bool = False
+
+
+# ============================================================
+# PASSWORD RESET - CONFIRM
+# ============================================================
+
+class PasswordResetConfirmRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid"
+    )
+
+    reset_token: str = Field(
+        ...,
+        min_length=1,
+    )
+
+    new_password: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password_strength(
+        cls,
+        value: str,
+    ) -> str:
+        if not re.search(r"[A-Z]", value):
+            raise ValueError(
+                "Password must contain at least 1 uppercase letter."
+            )
+
+        if not re.search(r"[a-z]", value):
+            raise ValueError(
+                "Password must contain at least 1 lowercase letter."
+            )
+
+        if not re.search(r"[0-9]", value):
+            raise ValueError(
+                "Password must contain at least 1 number."
+            )
+
+        if not re.search(r"[^A-Za-z0-9]", value):
+            raise ValueError(
+                "Password must contain at least 1 special character."
+            )
+
+        return value
+
+
+class PasswordResetConfirmResponse(BaseModel):
+    message: str

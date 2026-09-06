@@ -139,12 +139,27 @@ class AdminProgramCreate(BaseModel):
     program_name: str = Field(..., min_length=2, max_length=100)
     description: str | None = Field(default=None, max_length=255)
 
+    # Shared Semester master currently contains Semester 1 through 8.
+    # This value is a default only. Each Course/Branch stores its own
+    # authoritative total_semesters value.
+    default_semesters: int = Field(default=8, ge=1, le=8)
+
+
+class AdminProgramUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    program_code: str = Field(..., min_length=1, max_length=30)
+    program_name: str = Field(..., min_length=2, max_length=100)
+    description: str | None = Field(default=None, max_length=255)
+    default_semesters: int = Field(default=8, ge=1, le=8)
+
 
 class AdminProgramItem(BaseModel):
     program_id: int
     program_code: str
     program_name: str
     description: str | None = None
+    default_semesters: int
     is_active: bool
 
 
@@ -159,6 +174,18 @@ class AdminBranchCreate(BaseModel):
     branch_code: str = Field(..., min_length=1, max_length=30)
     branch_name: str = Field(..., min_length=2, max_length=100)
 
+    # Authoritative semester duration for this Course/Branch.
+    total_semesters: int = Field(..., ge=1, le=8)
+
+
+class AdminBranchUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    program_id: int = Field(..., gt=0)
+    branch_code: str = Field(..., min_length=1, max_length=30)
+    branch_name: str = Field(..., min_length=2, max_length=100)
+    total_semesters: int = Field(..., ge=1, le=8)
+
 
 class AdminBranchItem(BaseModel):
     branch_id: int
@@ -167,6 +194,7 @@ class AdminBranchItem(BaseModel):
     program_name: str
     branch_code: str
     branch_name: str
+    total_semesters: int
     is_active: bool
 
 
@@ -180,6 +208,20 @@ class AdminBranchMutationResponse(AdminBranchItem):
 
 class AdminSubjectCreate(BaseModel):
     """Create one subject inside Program -> Branch -> Semester."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    program_id: int = Field(..., gt=0)
+    branch_id: int = Field(..., gt=0)
+    semester_id: int = Field(..., gt=0)
+
+    subject_code: str = Field(..., min_length=1, max_length=30)
+    subject_name: str = Field(..., min_length=2, max_length=150)
+    credits: float | None = Field(default=None, ge=0, le=30)
+
+
+class AdminSubjectUpdate(BaseModel):
+    """Edit one existing subject."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -223,6 +265,46 @@ class AdminSubjectOptionsResponse(BaseModel):
     semesters: list[dict]
 
 
+class AdminSubjectImportRequest(BaseModel):
+    """Base64 file payload for CSV / XLSX / text-table PDF import."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_name: str = Field(..., min_length=1, max_length=255)
+    content_base64: str = Field(..., min_length=1)
+    dry_run: bool = True
+
+
+class AdminSubjectImportIssue(BaseModel):
+    row_number: int | None = None
+    message: str
+
+
+class AdminSubjectImportPreviewRow(BaseModel):
+    row_number: int
+    program: str
+    branch: str
+    semester_number: int | None = None
+    subject_code: str
+    subject_name: str
+    credits: float | None = None
+    action: str
+
+
+class AdminSubjectImportResponse(BaseModel):
+    file_name: str
+    dry_run: bool
+    total_rows: int
+    ready_to_import: int
+    skipped_existing: int
+    imported: int
+    error_count: int
+    total_credits_to_import: float
+    errors: list[AdminSubjectImportIssue]
+    preview_rows: list[AdminSubjectImportPreviewRow]
+    message: str
+
+
 # ============================================================
 # FACULTY ASSIGNMENT MANAGEMENT
 # ============================================================
@@ -232,6 +314,28 @@ class AdminFacultyAssignmentCreate(BaseModel):
     semester_id: int = Field(..., gt=0)
     section_id: int = Field(..., gt=0)
     subject_id: int = Field(..., gt=0)
+
+
+class AdminFacultyAssignmentSectionCreate(BaseModel):
+    """Add another section by copying an existing section scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_section_id: int = Field(..., gt=0)
+    section_name: str = Field(..., min_length=1, max_length=50)
+
+
+class AdminFacultyAssignmentSectionResponse(BaseModel):
+    section_id: int
+    section_name: str
+    semester_id: int
+
+    program_id: int | None = None
+    branch_id: int | None = None
+    academic_year_id: int | None = None
+
+    is_active: bool
+    message: str
 
 
 class AdminFacultyAssignmentItem(BaseModel):

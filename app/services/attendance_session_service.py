@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import base64
 import io
 import json
@@ -24,6 +24,12 @@ MAX_QR_EXPIRY_MINUTES = 15
 DEFAULT_GEOFENCE_RADIUS_METERS = 50.0
 MIN_GEOFENCE_RADIUS_METERS = 10.0
 MAX_GEOFENCE_RADIUS_METERS = 500.0
+
+
+def _utc_now_naive() -> datetime:
+    # Store attendance timestamps as timezone-naive UTC.
+    # MySQL DATETIME does not store timezone information.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ============================================================
@@ -247,7 +253,7 @@ def complete_timed_out_attendance_sessions(
     session state is read/changed.
     """
 
-    now = datetime.now()
+    now = _utc_now_naive()
 
     where_faculty = ""
     params = {
@@ -431,7 +437,7 @@ def create_attendance_session(
     # 7. SESSION TIME
     # --------------------------------------------------------
 
-    started_at = datetime.now()
+    started_at = _utc_now_naive()
 
     qr_expires_at = (
         started_at
@@ -615,7 +621,7 @@ def generate_attendance_session_qr(
     # VERIFY EXPIRY
     # --------------------------------------------------------
 
-    now = datetime.now()
+    now = _utc_now_naive()
 
     if (
         row["qr_expires_at"] is not None
@@ -933,7 +939,7 @@ def complete_attendance_session(
         }
 
     if session_status == "EXPIRED":
-        ended_at = row["ended_at"] or datetime.now()
+        ended_at = row["ended_at"] or _utc_now_naive()
 
         db.execute(
             text(
@@ -978,7 +984,7 @@ def complete_attendance_session(
             detail="Only an ACTIVE attendance session can be completed.",
         )
 
-    ended_at = datetime.now()
+    ended_at = _utc_now_naive()
 
     db.execute(
         text(
@@ -1090,7 +1096,7 @@ def cancel_attendance_session(
             ),
         )
 
-    ended_at = datetime.now()
+    ended_at = _utc_now_naive()
 
     db.execute(
         text(

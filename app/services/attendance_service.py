@@ -36,6 +36,191 @@ def _normalize_enum_value(value) -> str:
 
 
 # ============================================================
+# ATTENDANCE RESUME STATE
+# ============================================================
+
+def _next_verification_step(
+    *,
+    attendance_status: str,
+    qr_verified: bool,
+    geofence_verified: bool,
+    face_verified: bool,
+    liveness_verified: bool,
+) -> str | None:
+    """Derive the next step from the authoritative database state."""
+
+    if _normalize_enum_value(
+        attendance_status
+    ) != "PENDING":
+        return None
+
+    if not qr_verified:
+        return "QR"
+
+    if not geofence_verified:
+        return "GEOFENCE"
+
+    if not face_verified:
+        return "FACE"
+
+    if not liveness_verified:
+        return "LIVENESS"
+
+    return None
+
+
+def get_active_attendance_attempt(
+    db: Session,
+    current_user: User,
+) -> dict:
+    """Return the student's currently resumable PENDING attempt."""
+
+    student_id = _get_student_profile(
+        db=db,
+        current_user=current_user,
+    )
+
+    now = datetime.now()
+
+    attempt = db.execute(
+        text(
+            """
+            SELECT
+                ar.attendance_id,
+                ar.session_id,
+                ar.student_id,
+                ar.marked_at,
+
+                ar.qr_verified,
+                ar.geofence_verified,
+                ar.face_verified,
+                ar.liveness_verified,
+
+                ar.attendance_status,
+                ar.rejection_reason,
+
+                ats.subject_id,
+                ats.section_id,
+                ats.classroom_id,
+
+                s.subject_name,
+                sec.section_name
+
+            FROM attendance_records ar
+
+            INNER JOIN attendance_sessions ats
+                ON ats.session_id = ar.session_id
+
+            INNER JOIN subjects s
+                ON s.subject_id = ats.subject_id
+
+            INNER JOIN sections sec
+                ON sec.section_id = ats.section_id
+
+            WHERE ar.student_id = :student_id
+              AND ar.attendance_status = 'PENDING'
+              AND ats.session_status = 'ACTIVE'
+              AND ats.ended_at IS NULL
+              AND ats.qr_expires_at > :now
+
+            ORDER BY ar.attendance_id DESC
+
+            LIMIT 1
+            """
+        ),
+        {
+            "student_id": student_id,
+            "now": now,
+        },
+    ).mappings().first()
+
+    if attempt is None:
+        return {
+            "has_active_attempt": False,
+            "attempt": None,
+        }
+
+    next_step = _next_verification_step(
+        attendance_status=attempt[
+            "attendance_status"
+        ],
+        qr_verified=bool(
+            attempt["qr_verified"]
+        ),
+        geofence_verified=bool(
+            attempt["geofence_verified"]
+        ),
+        face_verified=bool(
+            attempt["face_verified"]
+        ),
+        liveness_verified=bool(
+            attempt["liveness_verified"]
+        ),
+    )
+
+    if next_step is None:
+        return {
+            "has_active_attempt": False,
+            "attempt": None,
+        }
+
+    return {
+        "has_active_attempt": True,
+        "attempt": {
+            "attendance_id":
+                int(attempt["attendance_id"]),
+
+            "session_id":
+                int(attempt["session_id"]),
+
+            "student_id":
+                int(attempt["student_id"]),
+
+            "subject_id":
+                int(attempt["subject_id"]),
+
+            "subject_name":
+                attempt["subject_name"],
+
+            "section_id":
+                int(attempt["section_id"]),
+
+            "section_name":
+                attempt["section_name"],
+
+            "classroom_id":
+                int(attempt["classroom_id"]),
+
+            "marked_at":
+                attempt["marked_at"],
+
+            "qr_verified":
+                bool(attempt["qr_verified"]),
+
+            "geofence_verified":
+                bool(attempt["geofence_verified"]),
+
+            "face_verified":
+                bool(attempt["face_verified"]),
+
+            "liveness_verified":
+                bool(attempt["liveness_verified"]),
+
+            "attendance_status":
+                _normalize_enum_value(
+                    attempt["attendance_status"]
+                ),
+
+            "rejection_reason":
+                attempt["rejection_reason"],
+
+            "next_verification_step":
+                next_step,
+        },
+    }
+
+
+# ============================================================
 # VERIFY STUDENT
 # ============================================================
 
@@ -448,14 +633,25 @@ def mark_attendance_with_qr(
         )
 
     # ========================================================
-    # 8. PREVENT DUPLICATE ATTENDANCE
+    # 8. RESUME EXISTING ATTEMPT / PREVENT DUPLICATE
     # ========================================================
 
     existing = db.execute(
         text(
             """
             SELECT
-                attendance_id
+                attendance_id,
+                session_id,
+                student_id,
+                marked_at,
+
+                qr_verified,
+                geofence_verified,
+                face_verified,
+                liveness_verified,
+
+                attendance_status,
+                rejection_reason
 
             FROM attendance_records
 
@@ -475,9 +671,111 @@ def mark_attendance_with_qr(
             "student_id":
                 student_id,
         },
-    ).first()
+    ).mappings().first()
 
     if existing is not None:
+        existing_status = _normalize_enum_value(
+            existing["attendance_status"]
+        )
+
+        if existing_status == "PENDING":
+            next_step = _next_verification_step(
+                attendance_status=existing_status,
+                qr_verified=bool(
+                    existing["qr_verified"]
+                ),
+                geofence_verified=bool(
+                    existing["geofence_verified"]
+                ),
+                face_verified=bool(
+                    existing["face_verified"]
+                ),
+                liveness_verified=bool(
+                    existing["liveness_verified"]
+                ),
+            )
+
+            if next_step is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "The existing attendance attempt "
+                        "has an inconsistent verification state."
+                    ),
+                )
+
+            return {
+                "attendance_id":
+                    int(existing["attendance_id"]),
+
+                "session_id":
+                    int(existing["session_id"]),
+
+                "student_id":
+                    int(existing["student_id"]),
+
+                "subject_id":
+                    int(row["subject_id"]),
+
+                "subject_name":
+                    row["subject_name"],
+
+                "section_id":
+                    int(row["section_id"]),
+
+                "section_name":
+                    row["section_name"],
+
+                "classroom_id":
+                    int(row["classroom_id"]),
+
+                "marked_at":
+                    existing["marked_at"],
+
+                "qr_verified":
+                    bool(existing["qr_verified"]),
+
+                "geofence_verified":
+                    bool(
+                        existing["geofence_verified"]
+                    ),
+
+                "face_verified":
+                    bool(existing["face_verified"]),
+
+                "liveness_verified":
+                    bool(
+                        existing["liveness_verified"]
+                    ),
+
+                "attendance_status":
+                    existing_status,
+
+                "rejection_reason":
+                    existing["rejection_reason"],
+
+                "next_verification_step":
+                    next_step,
+            }
+
+        if existing_status == "PRESENT":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Attendance has already been "
+                    "marked present for this session."
+                ),
+            )
+
+        if existing_status == "REJECTED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The attendance attempt for this "
+                    "session has already been rejected."
+                ),
+            )
+
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

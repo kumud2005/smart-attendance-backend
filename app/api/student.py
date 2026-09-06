@@ -14,6 +14,7 @@ from app.models.user import User
 # ============================================================
 
 from app.schemas.attendance import (
+    AttendanceActiveAttemptResponse,
     AttendanceGeofenceRequest,
     AttendanceGeofenceResponse,
     AttendanceMarkRequest,
@@ -44,6 +45,7 @@ from app.schemas.liveness import (
 # ============================================================
 
 from app.services.attendance_service import (
+    get_active_attendance_attempt,
     mark_attendance_with_qr,
     verify_attendance_geofence,
 )
@@ -131,6 +133,32 @@ def student_attendance_report(
     """
 
     return get_student_attendance_report(
+        db=db,
+        current_user=current_user,
+    )
+
+
+# ============================================================
+# ACTIVE / RESUMABLE ATTENDANCE ATTEMPT
+# ============================================================
+
+@router.get(
+    "/attendance/active-attempt",
+    response_model=AttendanceActiveAttemptResponse,
+)
+def active_attendance_attempt(
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+):
+    """
+    Return the student's current resumable attendance attempt.
+    """
+
+    return get_active_attendance_attempt(
         db=db,
         current_user=current_user,
     )

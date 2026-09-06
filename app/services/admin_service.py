@@ -9,6 +9,12 @@ the same functionality can later be reused by other interfaces.
 """
 
 from fastapi import HTTPException, status
+
+import base64
+import binascii
+import csv
+import io
+import re
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -622,6 +628,7 @@ def _program_row_to_dict(row, message: str | None = None) -> dict:
         "program_code": row["program_code"],
         "program_name": row["program_name"],
         "description": row["description"],
+        "default_semesters": int(row["default_semesters"]),
         "is_active": bool(row["is_active"]),
     }
     if message is not None:
@@ -633,7 +640,7 @@ def _get_program_row(db: Session, program_id: int):
     row = db.execute(
         text(
             """
-            SELECT program_id, program_code, program_name, description, is_active
+            SELECT program_id, program_code, program_name, description, default_semesters, is_active
             FROM degree_programs
             WHERE program_id = :program_id
             LIMIT 1
@@ -651,7 +658,7 @@ def list_programs(db: Session, active_only: bool = False) -> list[dict]:
     rows = db.execute(
         text(
             """
-            SELECT program_id, program_code, program_name, description, is_active
+            SELECT program_id, program_code, program_name, description, default_semesters, is_active
             FROM degree_programs
             """ + where_sql + " ORDER BY program_name, program_id"
         )
@@ -664,10 +671,17 @@ def create_program(
     program_code: str,
     program_name: str,
     description: str | None = None,
+    default_semesters: int = 8,
 ) -> dict:
     code = program_code.strip().upper()
     name = " ".join(program_name.strip().split())
     desc = description.strip() if description and description.strip() else None
+
+    if default_semesters < 1 or default_semesters > 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Default semesters must be between 1 and 8.",
+        )
 
     duplicate = db.execute(
         text(
@@ -689,13 +703,26 @@ def create_program(
             text(
                 """
                 INSERT INTO degree_programs (
-                    program_name, program_code, description, is_active
+                    program_name,
+                    program_code,
+                    description,
+                    default_semesters,
+                    is_active
                 ) VALUES (
-                    :name, :code, :description, 1
+                    :name,
+                    :code,
+                    :description,
+                    :default_semesters,
+                    1
                 )
                 """
             ),
-            {"name": name, "code": code, "description": desc},
+            {
+                "name": name,
+                "code": code,
+                "description": desc,
+                "default_semesters": default_semesters,
+            },
         )
         program_id = int(result.lastrowid)
         db.commit()
@@ -712,39 +739,285 @@ def create_program(
     )
 
 
+
+def update_program(
+    db: Session,
+    program_id: int,
+    program_code: str,
+    program_name: str,
+    description: str | None = None,
+    default_semesters: int = 8,
+) -> dict:
+    """
+    Edit an existing degree program without changing its primary key.
+
+    Existing branches remain attached by program_id. Changing the Program's
+    default semester count affects only the default used when creating/editing
+    course/branch duration; it does not silently rewrite existing branches.
+    """
+
+    _get_program_row(db, program_id)
+
+    code = program_code.strip().upper()
+    name = " ".join(program_name.strip().split())
+    desc = (
+        description.strip()
+        if description is not None and description.strip()
+        else None
+    )
+
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail="Program code is required.",
+        )
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Program name is required.",
+        )
+
+    if default_semesters < 1 or default_semesters > 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Default semesters must be between 1 and 8.",
+        )
+
+    duplicate = db.execute(
+        text(
+            """
+            SELECT program_id
+            FROM degree_programs
+            WHERE program_id <> :program_id
+              AND (
+                    UPPER(program_code) = :code
+                    OR UPPER(program_name) = UPPER(:name)
+                  )
+            LIMIT 1
+            """
+        ),
+        {
+            "program_id": program_id,
+            "code": code,
+            "name": name,
+        },
+    ).scalar()
+
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Another program with this code or name already exists."
+            ),
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE degree_programs
+                SET
+                    program_code = :code,
+                    program_name = :name,
+                    description = :description,
+                    default_semesters = :default_semesters
+                WHERE program_id = :program_id
+                """
+            ),
+            {
+                "program_id": program_id,
+                "code": code,
+                "name": name,
+                "description": desc,
+                "default_semesters": default_semesters,
+            },
+        )
+        db.commit()
+
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Program could not be updated because the new code or "
+                "name conflicts with existing data."
+            ),
+        ) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return _program_row_to_dict(
+        _get_program_row(db, program_id),
+        message="Program updated successfully.",
+    )
+
+
 def set_program_active_status(db: Session, program_id: int, is_active: bool) -> dict:
+    """
+    Activate or deactivate a Program.
+
+    Deactivation is cascade-style:
+    Program -> all active Branches/Courses -> all active Subjects
+
+    Historical rows are preserved; only is_active flags are changed.
+
+    Safety:
+    Deactivation is blocked while any ACTIVE attendance session is using
+    a subject under this Program.
+    """
+
     current = _get_program_row(db, program_id)
     desired = bool(is_active)
 
     if bool(current["is_active"]) == desired:
         return _program_row_to_dict(
             current,
-            message="Program is already active." if desired else "Program is already inactive.",
+            message=(
+                "Program is already active."
+                if desired
+                else "Program is already inactive."
+            ),
         )
 
-    if not desired:
-        active_branch = db.execute(
-            text("SELECT branch_id FROM branches WHERE program_id = :program_id AND is_active = 1 LIMIT 1"),
-            {"program_id": program_id},
-        ).scalar()
-        active_subject = db.execute(
-            text("SELECT subject_id FROM subjects WHERE program_id = :program_id AND is_active = 1 LIMIT 1"),
-            {"program_id": program_id},
-        ).scalar()
-        if active_branch is not None or active_subject is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Deactivate this program's active courses/branches and subjects first.",
+    if desired:
+        # Intentionally do not auto-reactivate child Branches/Subjects.
+        # Some may have been manually deactivated before the Program itself
+        # was disabled, so restoring all of them would be unsafe.
+        try:
+            db.execute(
+                text(
+                    """
+                    UPDATE degree_programs
+                    SET is_active = 1
+                    WHERE program_id = :program_id
+                    """
+                ),
+                {"program_id": program_id},
             )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
-    db.execute(
-        text("UPDATE degree_programs SET is_active = :active WHERE program_id = :program_id"),
-        {"active": 1 if desired else 0, "program_id": program_id},
+        return _program_row_to_dict(
+            _get_program_row(db, program_id),
+            message=(
+                "Program activated successfully. "
+                "Courses/branches and subjects remain in their current "
+                "status and can be activated separately."
+            ),
+        )
+
+    active_session_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM attendance_sessions a
+                INNER JOIN subjects s
+                    ON s.subject_id = a.subject_id
+                WHERE s.program_id = :program_id
+                  AND a.session_status = 'ACTIVE'
+                """
+            ),
+            {"program_id": program_id},
+        ).scalar()
+        or 0
     )
-    db.commit()
+
+    if active_session_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Program cannot be deactivated while "
+                f"{active_session_count} ACTIVE attendance session(s) "
+                "are running under it. Complete or cancel those sessions "
+                "first."
+            ),
+        )
+
+    active_branch_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM branches
+                WHERE program_id = :program_id
+                  AND is_active = 1
+                """
+            ),
+            {"program_id": program_id},
+        ).scalar()
+        or 0
+    )
+
+    active_subject_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM subjects
+                WHERE program_id = :program_id
+                  AND is_active = 1
+                """
+            ),
+            {"program_id": program_id},
+        ).scalar()
+        or 0
+    )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE subjects
+                SET is_active = 0
+                WHERE program_id = :program_id
+                  AND is_active = 1
+                """
+            ),
+            {"program_id": program_id},
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE branches
+                SET is_active = 0
+                WHERE program_id = :program_id
+                  AND is_active = 1
+                """
+            ),
+            {"program_id": program_id},
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE degree_programs
+                SET is_active = 0
+                WHERE program_id = :program_id
+                """
+            ),
+            {"program_id": program_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
     return _program_row_to_dict(
         _get_program_row(db, program_id),
-        message="Program activated successfully." if desired else "Program deactivated successfully.",
+        message=(
+            "Program deactivated successfully. "
+            f"{active_branch_count} active course/branch record(s) and "
+            f"{active_subject_count} active subject record(s) were also "
+            "deactivated. Historical data was preserved."
+        ),
     )
 
 
@@ -780,6 +1053,7 @@ def _branch_row_to_dict(row, message: str | None = None) -> dict:
         "program_name": row["program_name"],
         "branch_code": row["branch_code"],
         "branch_name": row["branch_name"],
+        "total_semesters": int(row["total_semesters"]),
         "is_active": bool(row["is_active"]),
     }
     if message is not None:
@@ -791,7 +1065,8 @@ def _get_branch_row(db: Session, branch_id: int):
     row = db.execute(
         text(
             """
-            SELECT b.branch_id, b.program_id, b.branch_code, b.branch_name, b.is_active,
+            SELECT b.branch_id, b.program_id, b.branch_code, b.branch_name,
+                   b.total_semesters, b.is_active,
                    p.program_code, p.program_name
             FROM branches b
             INNER JOIN degree_programs p ON p.program_id = b.program_id
@@ -822,7 +1097,8 @@ def list_branches(
     rows = db.execute(
         text(
             """
-            SELECT b.branch_id, b.program_id, b.branch_code, b.branch_name, b.is_active,
+            SELECT b.branch_id, b.program_id, b.branch_code, b.branch_name,
+                   b.total_semesters, b.is_active,
                    p.program_code, p.program_name
             FROM branches b
             INNER JOIN degree_programs p ON p.program_id = b.program_id
@@ -838,10 +1114,17 @@ def create_branch(
     program_id: int,
     branch_code: str,
     branch_name: str,
+    total_semesters: int,
 ) -> dict:
     program = _get_program_row(db, program_id)
     if not bool(program["is_active"]):
         raise HTTPException(status_code=409, detail="Selected program is inactive.")
+
+    if total_semesters < 1 or total_semesters > 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Course/branch semesters must be between 1 and 8.",
+        )
 
     code = branch_code.strip().upper()
     name = " ".join(branch_name.strip().split())
@@ -864,11 +1147,28 @@ def create_branch(
         result = db.execute(
             text(
                 """
-                INSERT INTO branches (program_id, branch_name, branch_code, is_active)
-                VALUES (:program_id, :name, :code, 1)
+                INSERT INTO branches (
+                    program_id,
+                    branch_name,
+                    branch_code,
+                    total_semesters,
+                    is_active
+                )
+                VALUES (
+                    :program_id,
+                    :name,
+                    :code,
+                    :total_semesters,
+                    1
+                )
                 """
             ),
-            {"program_id": program_id, "name": name, "code": code},
+            {
+                "program_id": program_id,
+                "name": name,
+                "code": code,
+                "total_semesters": total_semesters,
+            },
         )
         branch_id = int(result.lastrowid)
         db.commit()
@@ -885,35 +1185,358 @@ def create_branch(
     )
 
 
+
+def update_branch(
+    db: Session,
+    branch_id: int,
+    program_id: int,
+    branch_code: str,
+    branch_name: str,
+    total_semesters: int,
+) -> dict:
+    """
+    Edit an existing Course / Branch.
+
+    Safe rules:
+    - Code/name may be corrected while preserving branch_id.
+    - Semester duration may increase freely.
+    - Duration may not be reduced below semesters already used by Subjects
+      or Sections in this Branch.
+    - Moving to another Program is allowed only when the Branch has no
+      linked academic/profile records.
+    """
+
+    current = _get_branch_row(db, branch_id)
+    target_program = _get_program_row(db, program_id)
+
+    if not bool(target_program["is_active"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected parent program is inactive.",
+        )
+
+    if total_semesters < 1 or total_semesters > 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Course/branch semesters must be between 1 and 8.",
+        )
+
+    code = branch_code.strip().upper()
+    name = " ".join(branch_name.strip().split())
+
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail="Course / branch code is required.",
+        )
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Course / branch name is required.",
+        )
+
+    duplicate = db.execute(
+        text(
+            """
+            SELECT branch_id
+            FROM branches
+            WHERE branch_id <> :branch_id
+              AND program_id = :program_id
+              AND (
+                    UPPER(branch_code) = :code
+                    OR UPPER(branch_name) = UPPER(:name)
+                  )
+            LIMIT 1
+            """
+        ),
+        {
+            "branch_id": branch_id,
+            "program_id": program_id,
+            "code": code,
+            "name": name,
+        },
+    ).scalar()
+
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The selected Program already has another Course / Branch "
+                "with this code or name."
+            ),
+        )
+
+    current_program_id = int(current["program_id"])
+    moving_program = current_program_id != program_id
+
+    if moving_program:
+        dependencies = {
+            "subjects": _reference_count(
+                db, "subjects", "branch_id", branch_id
+            ),
+            "students": _reference_count(
+                db, "student_profiles", "branch_id", branch_id
+            ),
+            "faculty": _reference_count(
+                db, "faculty_profiles", "branch_id", branch_id
+            ),
+            "sections": _reference_count(
+                db, "sections", "branch_id", branch_id
+            ),
+            "faculty assignment requests": _reference_count(
+                db, "faculty_assignment_requests", "branch_id", branch_id
+            ),
+        }
+
+        used = [
+            f"{count} {label}"
+            for label, count in dependencies.items()
+            if count
+        ]
+
+        if used:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This Course / Branch cannot be moved to another Program "
+                    "because it is already referenced by "
+                    + ", ".join(used)
+                    + ". You may still edit its code, name or semester count."
+                ),
+            )
+
+    # Prevent a duration reduction that would hide semesters already used
+    # by subject or section data in this Branch.
+    highest_subject_semester = db.execute(
+        text(
+            """
+            SELECT MAX(sem.semester_number)
+            FROM subjects s
+            INNER JOIN semesters sem
+                ON sem.semester_id = s.semester_id
+            WHERE s.branch_id = :branch_id
+            """
+        ),
+        {"branch_id": branch_id},
+    ).scalar()
+
+    highest_section_semester = None
+    if _column_exists(db, "sections", "branch_id"):
+        highest_section_semester = db.execute(
+            text(
+                """
+                SELECT MAX(sem.semester_number)
+                FROM sections sec
+                INNER JOIN semesters sem
+                    ON sem.semester_id = sec.semester_id
+                WHERE sec.branch_id = :branch_id
+                """
+            ),
+            {"branch_id": branch_id},
+        ).scalar()
+
+    highest_used = max(
+        int(highest_subject_semester or 0),
+        int(highest_section_semester or 0),
+    )
+
+    if total_semesters < highest_used:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Semester count cannot be reduced to {total_semesters} "
+                f"because this Course / Branch already contains academic "
+                f"records in Semester {highest_used}."
+            ),
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE branches
+                SET
+                    program_id = :program_id,
+                    branch_code = :code,
+                    branch_name = :name,
+                    total_semesters = :total_semesters
+                WHERE branch_id = :branch_id
+                """
+            ),
+            {
+                "branch_id": branch_id,
+                "program_id": program_id,
+                "code": code,
+                "name": name,
+                "total_semesters": total_semesters,
+            },
+        )
+        db.commit()
+
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Course / branch could not be updated because the new "
+                "values conflict with existing academic data."
+            ),
+        ) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return _branch_row_to_dict(
+        _get_branch_row(db, branch_id),
+        message="Course / branch updated successfully.",
+    )
+
+
 def set_branch_active_status(db: Session, branch_id: int, is_active: bool) -> dict:
+    """
+    Activate or deactivate one Course / Branch.
+
+    Deactivation is cascade-style:
+    Branch/Course -> all active Subjects
+
+    Historical data remains untouched.
+
+    Safety:
+    Deactivation is blocked while an ACTIVE attendance session is using
+    a subject under this Branch.
+    """
+
     current = _get_branch_row(db, branch_id)
     desired = bool(is_active)
+
     if bool(current["is_active"]) == desired:
         return _branch_row_to_dict(
             current,
-            message="Course/branch is already active." if desired else "Course/branch is already inactive.",
+            message=(
+                "Course/branch is already active."
+                if desired
+                else "Course/branch is already inactive."
+            ),
         )
 
     if desired:
-        program = _get_program_row(db, int(current["program_id"]))
+        program = _get_program_row(
+            db,
+            int(current["program_id"]),
+        )
+
         if not bool(program["is_active"]):
-            raise HTTPException(status_code=409, detail="Activate the parent program first.")
-    else:
-        active_subject = db.execute(
-            text("SELECT subject_id FROM subjects WHERE branch_id = :branch_id AND is_active = 1 LIMIT 1"),
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Activate the parent program first.",
+            )
+
+        try:
+            db.execute(
+                text(
+                    """
+                    UPDATE branches
+                    SET is_active = 1
+                    WHERE branch_id = :branch_id
+                    """
+                ),
+                {"branch_id": branch_id},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+        return _branch_row_to_dict(
+            _get_branch_row(db, branch_id),
+            message=(
+                "Course/branch activated successfully. "
+                "Subjects remain in their current status and can be "
+                "activated separately."
+            ),
+        )
+
+    active_session_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM attendance_sessions a
+                INNER JOIN subjects s
+                    ON s.subject_id = a.subject_id
+                WHERE s.branch_id = :branch_id
+                  AND a.session_status = 'ACTIVE'
+                """
+            ),
             {"branch_id": branch_id},
         ).scalar()
-        if active_subject is not None:
-            raise HTTPException(status_code=409, detail="Deactivate this course/branch's active subjects first.")
-
-    db.execute(
-        text("UPDATE branches SET is_active = :active WHERE branch_id = :branch_id"),
-        {"active": 1 if desired else 0, "branch_id": branch_id},
+        or 0
     )
-    db.commit()
+
+    if active_session_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Course/branch cannot be deactivated while "
+                f"{active_session_count} ACTIVE attendance session(s) "
+                "are running under it. Complete or cancel those sessions "
+                "first."
+            ),
+        )
+
+    active_subject_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM subjects
+                WHERE branch_id = :branch_id
+                  AND is_active = 1
+                """
+            ),
+            {"branch_id": branch_id},
+        ).scalar()
+        or 0
+    )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE subjects
+                SET is_active = 0
+                WHERE branch_id = :branch_id
+                  AND is_active = 1
+                """
+            ),
+            {"branch_id": branch_id},
+        )
+
+        db.execute(
+            text(
+                """
+                UPDATE branches
+                SET is_active = 0
+                WHERE branch_id = :branch_id
+                """
+            ),
+            {"branch_id": branch_id},
+        )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
     return _branch_row_to_dict(
         _get_branch_row(db, branch_id),
-        message="Course/branch activated successfully." if desired else "Course/branch deactivated successfully.",
+        message=(
+            "Course/branch deactivated successfully. "
+            f"{active_subject_count} active subject record(s) were also "
+            "deactivated. Historical data was preserved."
+        ),
     )
 
 
@@ -979,7 +1602,8 @@ def get_subject_management_options(db: Session) -> dict:
             SELECT
                 program_id,
                 program_code,
-                program_name
+                program_name,
+                default_semesters
             FROM degree_programs
             WHERE is_active = 1
             ORDER BY program_name, program_id
@@ -994,7 +1618,8 @@ def get_subject_management_options(db: Session) -> dict:
                 branch_id,
                 program_id,
                 branch_code,
-                branch_name
+                branch_name,
+                total_semesters
             FROM branches
             WHERE is_active = 1
             ORDER BY program_id, branch_name, branch_id
@@ -1169,6 +1794,7 @@ def create_subject(
                 b.branch_code,
                 b.branch_name,
                 b.program_id,
+                b.total_semesters,
                 b.is_active AS branch_is_active,
                 p.program_code,
                 p.program_name,
@@ -1226,6 +1852,18 @@ def create_subject(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Selected semester does not exist.",
+        )
+
+    semester_number = int(semester["semester_number"])
+    total_semesters = int(academic_scope["total_semesters"])
+
+    if semester_number > total_semesters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Selected course/branch has only {total_semesters} semester(s). "
+                f"Semester {semester_number} is outside its configured duration."
+            ),
         )
 
     normalized_code = subject_code.strip().upper()
@@ -1319,6 +1957,900 @@ def create_subject(
     return _subject_row_to_dict(
         row,
         message="Subject added successfully.",
+    )
+
+
+# ============================================================
+# SUBJECT CATALOG FILE IMPORT
+# ============================================================
+
+_SUBJECT_IMPORT_MAX_BYTES = 10 * 1024 * 1024
+_SUBJECT_IMPORT_MAX_ROWS = 5000
+
+
+def _normalize_subject_import_header(value) -> str:
+    text_value = str(value or "").strip().lower()
+    text_value = re.sub(r"[^a-z0-9]+", "_", text_value)
+    return text_value.strip("_")
+
+
+def _subject_import_pick(row: dict, *aliases: str):
+    for alias in aliases:
+        key = _normalize_subject_import_header(alias)
+        if key in row:
+            value = row[key]
+            if value is not None and str(value).strip() != "":
+                return value
+    return None
+
+
+def _subject_import_dict_from_headers(headers, values) -> dict:
+    normalized_headers = [
+        _normalize_subject_import_header(value)
+        for value in headers
+    ]
+
+    result: dict = {}
+    for index, key in enumerate(normalized_headers):
+        if not key:
+            continue
+        result[key] = values[index] if index < len(values) else None
+    return result
+
+
+def _subject_import_header_is_usable(headers) -> bool:
+    normalized = {
+        _normalize_subject_import_header(value)
+        for value in headers
+        if value is not None
+    }
+
+    groups = (
+        {"program", "program_code", "program_name"},
+        {"branch", "branch_code", "branch_name", "course", "course_code", "course_name"},
+        {"semester", "semester_number", "sem"},
+        {"subject_code", "code"},
+        {"subject_name", "subject"},
+    )
+
+    return all(bool(normalized.intersection(group)) for group in groups)
+
+
+def _parse_subject_import_csv(file_bytes: bytes) -> list[dict]:
+    try:
+        decoded = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV file must use UTF-8 encoding.",
+        ) from exc
+
+    reader = csv.reader(io.StringIO(decoded))
+    rows = list(reader)
+    if not rows:
+        return []
+
+    headers = rows[0]
+    if not _subject_import_header_is_usable(headers):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "CSV header is invalid. Required columns are Program, Branch, "
+                "Semester, Subject Code and Subject Name. Credits is optional."
+            ),
+        )
+
+    parsed: list[dict] = []
+    for excel_row_number, values in enumerate(rows[1:], start=2):
+        if not any(str(value or "").strip() for value in values):
+            continue
+        parsed.append({
+            "row_number": excel_row_number,
+            "data": _subject_import_dict_from_headers(headers, values),
+        })
+    return parsed
+
+
+def _parse_subject_import_xlsx(file_bytes: bytes) -> list[dict]:
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Excel import dependency is missing. Install it with: "
+                "pip install openpyxl"
+            ),
+        ) from exc
+
+    try:
+        workbook = load_workbook(
+            io.BytesIO(file_bytes),
+            read_only=True,
+            data_only=True,
+        )
+        worksheet = workbook.active
+        rows = list(worksheet.iter_rows(values_only=True))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to read Excel file: {exc}",
+        ) from exc
+
+    if not rows:
+        return []
+
+    headers = list(rows[0])
+    if not _subject_import_header_is_usable(headers):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Excel header is invalid. Required columns are Program, Branch, "
+                "Semester, Subject Code and Subject Name. Credits is optional."
+            ),
+        )
+
+    parsed: list[dict] = []
+    for excel_row_number, values in enumerate(rows[1:], start=2):
+        if not any(str(value or "").strip() for value in values):
+            continue
+        parsed.append({
+            "row_number": excel_row_number,
+            "data": _subject_import_dict_from_headers(headers, list(values)),
+        })
+    return parsed
+
+
+def _parse_subject_import_delimited_text(text_value: str) -> list[dict]:
+    lines = [line.strip() for line in text_value.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    delimiters = ("|", "\t", ",", ";")
+    for delimiter in delimiters:
+        for header_index, line in enumerate(lines[:30]):
+            headers = [part.strip() for part in line.split(delimiter)]
+            if not _subject_import_header_is_usable(headers):
+                continue
+
+            parsed: list[dict] = []
+            for index, data_line in enumerate(lines[header_index + 1 :], start=header_index + 2):
+                values = [part.strip() for part in data_line.split(delimiter)]
+                if len(values) < 5:
+                    continue
+                parsed.append({
+                    "row_number": index,
+                    "data": _subject_import_dict_from_headers(headers, values),
+                })
+            return parsed
+
+    return []
+
+
+def _parse_subject_import_pdf(file_bytes: bytes) -> list[dict]:
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PDF import dependency is missing. Install it with: "
+                "pip install pdfplumber"
+            ),
+        ) from exc
+
+    parsed: list[dict] = []
+    extracted_text: list[str] = []
+    running_row_number = 2
+
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    extracted_text.append(page_text)
+
+                for table in page.extract_tables() or []:
+                    if not table:
+                        continue
+
+                    header_index = None
+                    headers = None
+
+                    for candidate_index, candidate in enumerate(table[:8]):
+                        if candidate and _subject_import_header_is_usable(candidate):
+                            header_index = candidate_index
+                            headers = candidate
+                            break
+
+                    if headers is None or header_index is None:
+                        continue
+
+                    for values in table[header_index + 1 :]:
+                        if not values or not any(str(value or "").strip() for value in values):
+                            continue
+
+                        # Repeated table headers on later pages are ignored.
+                        if _subject_import_header_is_usable(values):
+                            continue
+
+                        parsed.append({
+                            "row_number": running_row_number,
+                            "data": _subject_import_dict_from_headers(headers, values),
+                        })
+                        running_row_number += 1
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to read PDF file: {exc}",
+        ) from exc
+
+    if parsed:
+        return parsed
+
+    # Fallback for PDFs whose extracted text is already delimiter-separated.
+    fallback = _parse_subject_import_delimited_text("\n".join(extracted_text))
+    if fallback:
+        return fallback
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No usable subject table was found in the PDF. PDF import supports "
+            "text-based tables, not scanned/image-only PDFs. Use CSV or XLSX for "
+            "the most reliable import."
+        ),
+    )
+
+
+def _parse_subject_import_file(file_name: str, file_bytes: bytes) -> list[dict]:
+    extension = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+
+    if extension == "csv":
+        rows = _parse_subject_import_csv(file_bytes)
+    elif extension == "xlsx":
+        rows = _parse_subject_import_xlsx(file_bytes)
+    elif extension == "pdf":
+        rows = _parse_subject_import_pdf(file_bytes)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Upload CSV, XLSX or PDF.",
+        )
+
+    if len(rows) > _SUBJECT_IMPORT_MAX_ROWS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Import is limited to {_SUBJECT_IMPORT_MAX_ROWS} subject rows per file.",
+        )
+
+    return rows
+
+
+def _subject_import_semester_number(value) -> int | None:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if float(value) == float(number) else None
+
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+    return int(match.group(0))
+
+
+def _subject_import_credit(value) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        return None
+
+    return number
+
+
+def import_subject_catalog(
+    db: Session,
+    file_name: str,
+    content_base64: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Validate and optionally import an academic subject catalog.
+
+    Program and Branch values in the file are identifiers used to resolve
+    EXISTING academic structure. They may be either code or exact name.
+    Missing/inactive Program or Branch values are reported as row errors;
+    this endpoint never silently invents academic structure.
+    """
+
+    safe_name = file_name.strip()
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="File name is required.")
+
+    try:
+        file_bytes = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file payload is invalid.") from exc
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if len(file_bytes) > _SUBJECT_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Uploaded file must be 10 MB or smaller.")
+
+    parsed_rows = _parse_subject_import_file(safe_name, file_bytes)
+    if not parsed_rows:
+        raise HTTPException(status_code=400, detail="The uploaded file contains no subject rows.")
+
+    program_rows = db.execute(
+        text(
+            """
+            SELECT program_id, program_code, program_name, is_active
+            FROM degree_programs
+            """
+        )
+    ).mappings().all()
+
+    branch_rows = db.execute(
+        text(
+            """
+            SELECT branch_id, program_id, branch_code, branch_name,
+                   total_semesters, is_active
+            FROM branches
+            """
+        )
+    ).mappings().all()
+
+    semester_rows = db.execute(
+        text(
+            """
+            SELECT semester_id, semester_number, semester_name
+            FROM semesters
+            """
+        )
+    ).mappings().all()
+
+    existing_subject_rows = db.execute(
+        text(
+            """
+            SELECT subject_id, program_id, branch_id, semester_id,
+                   subject_code, subject_name, credits
+            FROM subjects
+            """
+        )
+    ).mappings().all()
+
+    def key(value) -> str:
+        return " ".join(str(value or "").strip().split()).upper()
+
+    programs_by_code = {key(row["program_code"]): row for row in program_rows}
+    programs_by_name = {key(row["program_name"]): row for row in program_rows}
+
+    branches_by_program: dict[int, dict[str, dict]] = {}
+    for row in branch_rows:
+        program_id = int(row["program_id"])
+        bucket = branches_by_program.setdefault(program_id, {})
+        bucket[f"CODE:{key(row['branch_code'])}"] = row
+        bucket[f"NAME:{key(row['branch_name'])}"] = row
+
+    semesters_by_number = {
+        int(row["semester_number"]): row
+        for row in semester_rows
+        if row["semester_number"] is not None
+    }
+
+    existing_by_code = {
+        key(row["subject_code"]): row
+        for row in existing_subject_rows
+    }
+
+    errors: list[dict] = []
+    preview_rows: list[dict] = []
+    ready_rows: list[dict] = []
+    skipped_existing = 0
+    file_codes: dict[str, tuple] = {}
+
+    for item in parsed_rows:
+        row_number = int(item["row_number"])
+        raw = {
+            _normalize_subject_import_header(k): v
+            for k, v in dict(item["data"]).items()
+        }
+
+        program_value = _subject_import_pick(
+            raw,
+            "program_code", "program", "program_name",
+        )
+        branch_value = _subject_import_pick(
+            raw,
+            "branch_code", "branch", "course_code", "course", "branch_name", "course_name",
+        )
+        semester_value = _subject_import_pick(
+            raw,
+            "semester_number", "semester", "sem",
+        )
+        subject_code_value = _subject_import_pick(
+            raw,
+            "subject_code", "code",
+        )
+        subject_name_value = _subject_import_pick(
+            raw,
+            "subject_name", "subject",
+        )
+        credits_value = _subject_import_pick(
+            raw,
+            "credits", "credit",
+        )
+
+        program_text = " ".join(str(program_value or "").strip().split())
+        branch_text = " ".join(str(branch_value or "").strip().split())
+        subject_code = str(subject_code_value or "").strip().upper()
+        subject_name = " ".join(str(subject_name_value or "").strip().split())
+        semester_number = _subject_import_semester_number(semester_value)
+        credits = _subject_import_credit(credits_value)
+
+        row_errors: list[str] = []
+
+        if not program_text:
+            row_errors.append("Program is required.")
+        if not branch_text:
+            row_errors.append("Branch/Course is required.")
+        if semester_number is None:
+            row_errors.append("Semester must contain a valid semester number.")
+        if not subject_code:
+            row_errors.append("Subject Code is required.")
+        if not subject_name:
+            row_errors.append("Subject Name is required.")
+        if credits_value is not None and str(credits_value).strip() != "" and credits is None:
+            row_errors.append("Credits must be numeric.")
+        if credits is not None and not (0 <= credits <= 30):
+            row_errors.append("Credits must be between 0 and 30.")
+
+        program = None
+        branch = None
+        semester = None
+
+        if program_text:
+            program = programs_by_code.get(key(program_text)) or programs_by_name.get(key(program_text))
+            if program is None:
+                row_errors.append(f"Program '{program_text}' does not exist.")
+            elif not bool(program["is_active"]):
+                row_errors.append(f"Program '{program_text}' is inactive.")
+
+        if branch_text and program is not None:
+            bucket = branches_by_program.get(int(program["program_id"]), {})
+            branch = bucket.get(f"CODE:{key(branch_text)}") or bucket.get(f"NAME:{key(branch_text)}")
+            if branch is None:
+                row_errors.append(
+                    f"Branch/Course '{branch_text}' does not exist under Program '{program_text}'."
+                )
+            elif not bool(branch["is_active"]):
+                row_errors.append(f"Branch/Course '{branch_text}' is inactive.")
+
+        if semester_number is not None:
+            semester = semesters_by_number.get(semester_number)
+            if semester is None:
+                row_errors.append(f"Semester {semester_number} does not exist in the semester master.")
+            elif branch is not None and semester_number > int(branch["total_semesters"]):
+                row_errors.append(
+                    f"{branch['branch_code']} has only {int(branch['total_semesters'])} semester(s); "
+                    f"Semester {semester_number} is outside its configured duration."
+                )
+
+        action = "ERROR"
+
+        if not row_errors and program is not None and branch is not None and semester is not None:
+            fingerprint = (
+                int(program["program_id"]),
+                int(branch["branch_id"]),
+                int(semester["semester_id"]),
+                subject_name.casefold(),
+                credits,
+            )
+
+            duplicate_in_file = file_codes.get(key(subject_code))
+            if duplicate_in_file is not None:
+                if duplicate_in_file == fingerprint:
+                    action = "SKIP_DUPLICATE_ROW"
+                    skipped_existing += 1
+                else:
+                    row_errors.append(
+                        f"Subject code '{subject_code}' appears more than once with conflicting data in the file."
+                    )
+            else:
+                file_codes[key(subject_code)] = fingerprint
+
+            if not row_errors and action != "SKIP_DUPLICATE_ROW":
+                existing = existing_by_code.get(key(subject_code))
+                if existing is not None:
+                    existing_credits = float(existing["credits"]) if existing["credits"] is not None else None
+                    same_existing = (
+                        int(existing["program_id"]) == fingerprint[0]
+                        and int(existing["branch_id"]) == fingerprint[1]
+                        and int(existing["semester_id"]) == fingerprint[2]
+                        and str(existing["subject_name"]).strip().casefold() == fingerprint[3]
+                        and existing_credits == fingerprint[4]
+                    )
+                    if same_existing:
+                        action = "SKIP_EXISTING"
+                        skipped_existing += 1
+                    else:
+                        row_errors.append(
+                            f"Subject code '{subject_code}' already exists with different academic details."
+                        )
+                else:
+                    action = "CREATE"
+                    ready_rows.append({
+                        "row_number": row_number,
+                        "program_id": int(program["program_id"]),
+                        "branch_id": int(branch["branch_id"]),
+                        "semester_id": int(semester["semester_id"]),
+                        "program": str(program["program_code"]),
+                        "branch": str(branch["branch_code"]),
+                        "semester_number": int(semester_number),
+                        "subject_code": subject_code,
+                        "subject_name": subject_name,
+                        "credits": credits,
+                    })
+
+        if row_errors:
+            action = "ERROR"
+            for message in row_errors:
+                errors.append({"row_number": row_number, "message": message})
+
+        if len(preview_rows) < 100:
+            preview_rows.append({
+                "row_number": row_number,
+                "program": program_text,
+                "branch": branch_text,
+                "semester_number": semester_number,
+                "subject_code": subject_code,
+                "subject_name": subject_name,
+                "credits": credits,
+                "action": action,
+            })
+
+    total_credits_to_import = round(
+        sum(float(row["credits"] or 0) for row in ready_rows),
+        2,
+    )
+
+    if not dry_run and errors:
+        first_errors = "; ".join(
+            f"Row {item['row_number']}: {item['message']}"
+            for item in errors[:5]
+        )
+        more = "" if len(errors) <= 5 else f" (+{len(errors) - 5} more errors)"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Import was cancelled because validation errors were found. "
+                f"{first_errors}{more}"
+            ),
+        )
+
+    imported = 0
+
+    if not dry_run and ready_rows:
+        try:
+            for row in ready_rows:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO subjects (
+                            program_id,
+                            branch_id,
+                            semester_id,
+                            subject_code,
+                            subject_name,
+                            credits,
+                            is_active
+                        ) VALUES (
+                            :program_id,
+                            :branch_id,
+                            :semester_id,
+                            :subject_code,
+                            :subject_name,
+                            :credits,
+                            1
+                        )
+                        """
+                    ),
+                    row,
+                )
+            db.commit()
+            imported = len(ready_rows)
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Import could not be completed because the database changed "
+                    "or a duplicate subject code was created. Preview the file again."
+                ),
+            ) from exc
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Unable to import subjects: {exc}") from exc
+
+    if dry_run:
+        if errors:
+            message = f"Preview found {len(errors)} validation error(s). No data was changed."
+        else:
+            message = (
+                f"Preview successful: {len(ready_rows)} new subject(s) ready to import; "
+                f"{skipped_existing} duplicate/existing row(s) will be skipped."
+            )
+    else:
+        message = (
+            f"Imported {imported} subject(s) successfully. "
+            f"{skipped_existing} duplicate/existing row(s) skipped."
+        )
+
+    return {
+        "file_name": safe_name,
+        "dry_run": bool(dry_run),
+        "total_rows": len(parsed_rows),
+        "ready_to_import": len(ready_rows),
+        "skipped_existing": skipped_existing,
+        "imported": imported,
+        "error_count": len(errors),
+        "total_credits_to_import": total_credits_to_import,
+        "errors": errors[:100],
+        "preview_rows": preview_rows,
+        "message": message,
+    }
+
+
+
+def update_subject(
+    db: Session,
+    subject_id: int,
+    program_id: int,
+    branch_id: int,
+    semester_id: int,
+    subject_code: str,
+    subject_name: str,
+    credits: float | None = None,
+) -> dict:
+    """
+    Edit an existing subject.
+
+    Subject code, name and credits may be corrected while preserving the
+    subject ID and historical references.
+
+    Moving a subject to another Program / Branch / Semester is allowed only
+    while the subject has never been referenced by Faculty assignments,
+    Faculty registration/assignment requests, or attendance sessions.
+    This prevents historical academic records from being silently changed.
+    """
+
+    current = _get_subject_row(
+        db=db,
+        subject_id=subject_id,
+    )
+
+    academic_scope = db.execute(
+        text(
+            """
+            SELECT
+                b.branch_id,
+                b.branch_code,
+                b.branch_name,
+                b.program_id,
+                b.total_semesters,
+                b.is_active AS branch_is_active,
+                p.program_code,
+                p.program_name,
+                p.is_active AS program_is_active
+            FROM branches b
+            INNER JOIN degree_programs p
+                ON p.program_id = b.program_id
+            WHERE b.branch_id = :branch_id
+            LIMIT 1
+            """
+        ),
+        {"branch_id": branch_id},
+    ).mappings().first()
+
+    if academic_scope is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Selected branch/department does not exist.",
+        )
+
+    if int(academic_scope["program_id"]) != program_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected branch does not belong to the selected program.",
+        )
+
+    if not bool(academic_scope["program_is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Selected program is inactive.",
+        )
+
+    if not bool(academic_scope["branch_is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Selected branch/department is inactive.",
+        )
+
+    semester = db.execute(
+        text(
+            """
+            SELECT
+                semester_id,
+                semester_number,
+                semester_name
+            FROM semesters
+            WHERE semester_id = :semester_id
+            LIMIT 1
+            """
+        ),
+        {"semester_id": semester_id},
+    ).mappings().first()
+
+    if semester is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Selected semester does not exist.",
+        )
+
+    semester_number = int(semester["semester_number"])
+    total_semesters = int(academic_scope["total_semesters"])
+
+    if semester_number > total_semesters:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Selected course/branch has only {total_semesters} semester(s). "
+                f"Semester {semester_number} is outside its configured duration."
+            ),
+        )
+
+    normalized_code = subject_code.strip().upper()
+    normalized_name = " ".join(subject_name.strip().split())
+
+    if not normalized_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Subject code is required.",
+        )
+
+    if not normalized_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Subject name is required.",
+        )
+
+    duplicate = db.execute(
+        text(
+            """
+            SELECT subject_id
+            FROM subjects
+            WHERE UPPER(subject_code) = :subject_code
+              AND subject_id <> :subject_id
+            LIMIT 1
+            """
+        ),
+        {
+            "subject_code": normalized_code,
+            "subject_id": subject_id,
+        },
+    ).scalar()
+
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another subject with this subject code already exists.",
+        )
+
+    scope_changed = (
+        int(current["program_id"]) != program_id
+        or int(current["branch_id"]) != branch_id
+        or int(current["semester_id"]) != semester_id
+    )
+
+    if scope_changed:
+        dependencies = {
+            "faculty assignment": _reference_count(
+                db,
+                "faculty_subject_assignments",
+                "subject_id",
+                subject_id,
+            ),
+            "faculty registration/assignment request": _reference_count(
+                db,
+                "faculty_assignment_requests",
+                "subject_id",
+                subject_id,
+            ),
+            "attendance session/history": _reference_count(
+                db,
+                "attendance_sessions",
+                "subject_id",
+                subject_id,
+            ),
+        }
+
+        used_by = [
+            f"{count} {label}{'' if count == 1 else 's'}"
+            for label, count in dependencies.items()
+            if count
+        ]
+
+        if used_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Program, branch or semester cannot be changed because "
+                    "this subject is already referenced by "
+                    + ", ".join(used_by)
+                    + ". You may still edit its code, name or credits, or "
+                    "deactivate it and create a new subject in the new scope."
+                ),
+            )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE subjects
+                SET
+                    program_id = :program_id,
+                    branch_id = :branch_id,
+                    semester_id = :semester_id,
+                    subject_code = :subject_code,
+                    subject_name = :subject_name,
+                    credits = :credits
+                WHERE subject_id = :subject_id
+                """
+            ),
+            {
+                "subject_id": subject_id,
+                "program_id": program_id,
+                "branch_id": branch_id,
+                "semester_id": semester_id,
+                "subject_code": normalized_code,
+                "subject_name": normalized_name,
+                "credits": credits,
+            },
+        )
+        db.commit()
+
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Unable to update the subject because the new values conflict "
+                "with existing academic data."
+            ),
+        ) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    updated = _get_subject_row(
+        db=db,
+        subject_id=subject_id,
+    )
+
+    return _subject_row_to_dict(
+        updated,
+        message="Subject updated successfully.",
     )
 
 
@@ -1572,7 +3104,10 @@ def get_faculty_assignment_options(
             SELECT
                 sec.section_id,
                 sec.section_name,
-                sec.semester_id
+                sec.semester_id,
+                sec.program_id,
+                sec.branch_id,
+                sec.academic_year_id
             FROM sections sec
             WHERE {section_where}
             ORDER BY sec.semester_id, sec.section_name
@@ -1589,7 +3124,9 @@ def get_faculty_assignment_options(
                 s.subject_code,
                 s.subject_name,
                 s.credits,
-                s.semester_id
+                s.semester_id,
+                s.program_id,
+                s.branch_id
             FROM subjects s
             WHERE {subject_where}
             ORDER BY s.semester_id, s.subject_code, s.subject_name
@@ -1626,6 +3163,21 @@ def get_faculty_assignment_options(
                 "section_id": int(row["section_id"]),
                 "section_name": row["section_name"],
                 "semester_id": int(row["semester_id"]),
+                "program_id": (
+                    int(row["program_id"])
+                    if row["program_id"] is not None
+                    else None
+                ),
+                "branch_id": (
+                    int(row["branch_id"])
+                    if row["branch_id"] is not None
+                    else None
+                ),
+                "academic_year_id": (
+                    int(row["academic_year_id"])
+                    if row["academic_year_id"] is not None
+                    else None
+                ),
             }
             for row in section_rows
         ],
@@ -1640,9 +3192,237 @@ def get_faculty_assignment_options(
                     else None
                 ),
                 "semester_id": int(row["semester_id"]),
+                "program_id": (
+                    int(row["program_id"])
+                    if row["program_id"] is not None
+                    else None
+                ),
+                "branch_id": (
+                    int(row["branch_id"])
+                    if row["branch_id"] is not None
+                    else None
+                ),
             }
             for row in subject_rows
         ],
+    }
+
+
+
+def create_faculty_assignment_section(
+    db: Session,
+    source_section_id: int,
+    section_name: str,
+) -> dict:
+    """
+    Add another section using an existing section as the academic-scope
+    template.
+
+    The new section inherits Program, Branch, Academic Year and Semester
+    from the selected existing section.
+    """
+
+    source = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                section_name,
+                program_id,
+                branch_id,
+                academic_year_id,
+                semester_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": source_section_id},
+    ).mappings().first()
+
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source section not found.",
+        )
+
+    if not bool(source["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Select an active section before adding another section.",
+        )
+
+    if source["semester_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The selected section does not have a semester configured.",
+        )
+
+    if source["academic_year_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The selected section does not have an academic year "
+                "configured, so its scope cannot be copied safely."
+            ),
+        )
+
+    normalized_name = " ".join(section_name.strip().split())
+
+    if normalized_name.lower().startswith("section "):
+        normalized_name = normalized_name[8:].strip()
+
+    if not normalized_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Section name is required.",
+        )
+
+    normalized_name = normalized_name.upper()
+
+    duplicate = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                is_active
+            FROM sections
+            WHERE UPPER(section_name) = :section_name
+              AND program_id <=> :program_id
+              AND branch_id <=> :branch_id
+              AND academic_year_id <=> :academic_year_id
+              AND semester_id = :semester_id
+            ORDER BY section_id DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "section_name": normalized_name,
+            "program_id": source["program_id"],
+            "branch_id": source["branch_id"],
+            "academic_year_id": source["academic_year_id"],
+            "semester_id": source["semester_id"],
+        },
+    ).mappings().first()
+
+    try:
+        if duplicate is not None:
+            section_id = int(duplicate["section_id"])
+
+            if bool(duplicate["is_active"]):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Section {normalized_name} already exists in "
+                        "this academic scope."
+                    ),
+                )
+
+            db.execute(
+                text(
+                    """
+                    UPDATE sections
+                    SET is_active = 1
+                    WHERE section_id = :section_id
+                    """
+                ),
+                {"section_id": section_id},
+            )
+
+            message = (
+                f"Section {normalized_name} reactivated successfully."
+            )
+
+        else:
+            result = db.execute(
+                text(
+                    """
+                    INSERT INTO sections (
+                        section_name,
+                        program_id,
+                        branch_id,
+                        academic_year_id,
+                        semester_id,
+                        is_active
+                    )
+                    VALUES (
+                        :section_name,
+                        :program_id,
+                        :branch_id,
+                        :academic_year_id,
+                        :semester_id,
+                        1
+                    )
+                    """
+                ),
+                {
+                    "section_name": normalized_name,
+                    "program_id": source["program_id"],
+                    "branch_id": source["branch_id"],
+                    "academic_year_id": source["academic_year_id"],
+                    "semester_id": source["semester_id"],
+                },
+            )
+
+            section_id = int(result.lastrowid)
+            message = f"Section {normalized_name} added successfully."
+
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    created = db.execute(
+        text(
+            """
+            SELECT
+                section_id,
+                section_name,
+                program_id,
+                branch_id,
+                academic_year_id,
+                semester_id,
+                is_active
+            FROM sections
+            WHERE section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {"section_id": section_id},
+    ).mappings().first()
+
+    if created is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Section was saved but could not be reloaded.",
+        )
+
+    return {
+        "section_id": int(created["section_id"]),
+        "section_name": created["section_name"],
+        "program_id": (
+            int(created["program_id"])
+            if created["program_id"] is not None
+            else None
+        ),
+        "branch_id": (
+            int(created["branch_id"])
+            if created["branch_id"] is not None
+            else None
+        ),
+        "academic_year_id": (
+            int(created["academic_year_id"])
+            if created["academic_year_id"] is not None
+            else None
+        ),
+        "semester_id": int(created["semester_id"]),
+        "is_active": bool(created["is_active"]),
+        "message": message,
     }
 
 
@@ -1843,6 +3623,8 @@ def create_faculty_assignment(
                 section_id,
                 section_name,
                 semester_id,
+                program_id,
+                branch_id,
                 academic_year_id,
                 is_active
             FROM sections
@@ -1897,6 +3679,8 @@ def create_faculty_assignment(
                 subject_code,
                 subject_name,
                 semester_id,
+                program_id,
+                branch_id,
                 is_active
             FROM subjects
             WHERE subject_id = :subject_id
@@ -1926,6 +3710,32 @@ def create_faculty_assignment(
             detail=(
                 "Selected subject does not belong to "
                 "the selected semester."
+            ),
+        )
+
+    if (
+        section["program_id"] is not None
+        and subject["program_id"] is not None
+        and int(section["program_id"]) != int(subject["program_id"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected subject belongs to a different Program "
+                "than the selected Section."
+            ),
+        )
+
+    if (
+        section["branch_id"] is not None
+        and subject["branch_id"] is not None
+        and int(section["branch_id"]) != int(subject["branch_id"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected subject belongs to a different Branch/Course "
+                "than the selected Section."
             ),
         )
 
@@ -2076,6 +3886,176 @@ def create_faculty_assignment(
     )
 
 
+
+def activate_faculty_assignment(
+    db: Session,
+    assignment_id: int,
+) -> dict:
+    """Reactivate one previously deactivated Faculty assignment safely."""
+
+    row = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {"assignment_id": assignment_id},
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Faculty assignment not found.",
+        )
+
+    if bool(row["is_active"]):
+        return _faculty_assignment_row_to_dict(
+            row,
+            message="Faculty assignment is already active.",
+        )
+
+    faculty_status = db.execute(
+        text(
+            """
+            SELECT u.account_status
+            FROM faculty_profiles fp
+            INNER JOIN users u
+                ON u.user_id = fp.user_id
+            WHERE fp.faculty_id = :faculty_id
+            LIMIT 1
+            """
+        ),
+        {"faculty_id": int(row["faculty_id"])},
+    ).scalar()
+
+    if _normalize_status(faculty_status) != "ACTIVE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Faculty account must be ACTIVE before this assignment can be activated.",
+        )
+
+    scope = db.execute(
+        text(
+            """
+            SELECT
+                sec.is_active AS section_active,
+                s.is_active AS subject_active,
+                p.is_active AS program_active,
+                b.is_active AS branch_active
+            FROM sections sec
+            INNER JOIN subjects s
+                ON s.subject_id = :subject_id
+            INNER JOIN degree_programs p
+                ON p.program_id = s.program_id
+            INNER JOIN branches b
+                ON b.branch_id = s.branch_id
+               AND b.program_id = p.program_id
+            WHERE sec.section_id = :section_id
+            LIMIT 1
+            """
+        ),
+        {
+            "subject_id": int(row["subject_id"]),
+            "section_id": int(row["section_id"]),
+        },
+    ).mappings().first()
+
+    if scope is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The assignment's academic scope is no longer available.",
+        )
+
+    if not bool(scope["program_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Activate the parent Program first.",
+        )
+
+    if not bool(scope["branch_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Activate the Course / Branch first.",
+        )
+
+    if not bool(scope["section_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Activate the Section first.",
+        )
+
+    if not bool(scope["subject_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Activate the Subject first.",
+        )
+
+    duplicate_active = db.execute(
+        text(
+            """
+            SELECT other.assignment_id
+            FROM faculty_subject_assignments target
+            INNER JOIN faculty_subject_assignments other
+                ON other.faculty_id = target.faculty_id
+               AND other.subject_id = target.subject_id
+               AND other.section_id = target.section_id
+               AND other.academic_year_id <=> target.academic_year_id
+            WHERE target.assignment_id = :assignment_id
+              AND other.assignment_id <> target.assignment_id
+              AND other.is_active = 1
+            LIMIT 1
+            """
+        ),
+        {"assignment_id": assignment_id},
+    ).scalar()
+
+    if duplicate_active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An equivalent Faculty assignment is already active.",
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE faculty_subject_assignments
+                SET is_active = 1
+                WHERE assignment_id = :assignment_id
+                """
+            ),
+            {"assignment_id": assignment_id},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    updated_row = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {"assignment_id": assignment_id},
+    ).mappings().first()
+
+    if updated_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Faculty assignment was activated but could not be reloaded.",
+        )
+
+    return _faculty_assignment_row_to_dict(
+        updated_row,
+        message="Faculty assignment activated successfully.",
+    )
+
+
 def deactivate_faculty_assignment(
     db: Session,
     assignment_id: int,
@@ -2183,6 +4163,91 @@ def deactivate_faculty_assignment(
 
 
 
+
+
+
+def delete_faculty_assignment(
+    db: Session,
+    assignment_id: int,
+) -> dict:
+    """
+    Permanently delete only an UNUSED and already INACTIVE assignment.
+
+    If the Faculty/Subject/Section combination has ever been used by an
+    attendance session, preserve the assignment history and keep it inactive.
+    """
+
+    row = db.execute(
+        text(
+            _faculty_assignment_select_sql()
+            + """
+              WHERE fsa.assignment_id = :assignment_id
+              LIMIT 1
+            """
+        ),
+        {"assignment_id": assignment_id},
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Faculty assignment not found.",
+        )
+
+    if bool(row["is_active"]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deactivate this Faculty assignment before deleting it permanently.",
+        )
+
+    session_count = int(
+        db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM attendance_sessions
+                WHERE faculty_id = :faculty_id
+                  AND subject_id = :subject_id
+                  AND section_id = :section_id
+                """
+            ),
+            {
+                "faculty_id": int(row["faculty_id"]),
+                "subject_id": int(row["subject_id"]),
+                "section_id": int(row["section_id"]),
+            },
+        ).scalar()
+        or 0
+    )
+
+    if session_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This Faculty assignment has attendance-session history and "
+                "cannot be deleted permanently. Keep it deactivated instead."
+            ),
+        )
+
+    try:
+        db.execute(
+            text(
+                """
+                DELETE FROM faculty_subject_assignments
+                WHERE assignment_id = :assignment_id
+                """
+            ),
+            {"assignment_id": assignment_id},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _faculty_assignment_row_to_dict(
+        row,
+        message="Faculty assignment deleted permanently.",
+    )
 
 
 # ============================================================

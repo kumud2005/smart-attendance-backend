@@ -18,8 +18,15 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token
+from app.core.config import settings
+from app.core.security import (
+    create_access_token,
+    create_password_reset_token,
+    decode_password_reset_token,
+    password_hash_fingerprint,
+)
 
+from app.models.branch import Branch  # noqa: F401 - registers branches table in ORM metadata
 from app.models.role import Role
 from app.models.user import User
 from app.models.faculty_profile import FacultyProfile
@@ -94,7 +101,8 @@ def get_registration_options(
             SELECT
                 program_id,
                 program_name,
-                program_code
+                program_code,
+                default_semesters
             FROM degree_programs
             WHERE is_active = 1
             ORDER BY program_name, program_id
@@ -109,7 +117,8 @@ def get_registration_options(
                 branch_id,
                 program_id,
                 branch_name,
-                branch_code
+                branch_code,
+                total_semesters
             FROM branches
             WHERE is_active = 1
             ORDER BY program_id, branch_name, branch_id
@@ -159,6 +168,8 @@ def get_registration_options(
             f"""
             SELECT
                 s.subject_id,
+                s.program_id,
+                s.branch_id,
                 s.subject_code,
                 s.subject_name,
                 s.semester_id
@@ -176,6 +187,7 @@ def get_registration_options(
                 "program_id": int(row["program_id"]),
                 "program_name": row["program_name"],
                 "program_code": row["program_code"],
+                "default_semesters": int(row["default_semesters"]),
             }
             for row in programs
         ],
@@ -185,6 +197,7 @@ def get_registration_options(
                 "program_id": int(row["program_id"]),
                 "branch_name": row["branch_name"],
                 "branch_code": row["branch_code"],
+                "total_semesters": int(row["total_semesters"]),
             }
             for row in branches
         ],
@@ -207,6 +220,8 @@ def get_registration_options(
         "subjects": [
             {
                 "subject_id": int(row["subject_id"]),
+                "program_id": int(row["program_id"]),
+                "branch_id": int(row["branch_id"]),
                 "subject_code": row["subject_code"],
                 "subject_name": row["subject_name"],
                 "semester_id": int(row["semester_id"]),
@@ -235,6 +250,7 @@ def _get_registration_branch(
                 b.branch_name,
                 b.branch_code,
                 b.program_id,
+                b.total_semesters,
                 b.is_active AS branch_is_active,
                 p.program_name,
                 p.program_code,
@@ -282,37 +298,56 @@ def _get_registration_branch(
 
 def _validate_faculty_requested_assignment(
     db: Session,
+    program_id: int,
+    branch_id: int,
+    max_semesters: int,
     semester_id: int,
     section_id: int,
     subject_id: int,
 ) -> None:
-    semester_exists = db.execute(
+    semester = db.execute(
         text(
             """
-            SELECT semester_id
+            SELECT
+                semester_id,
+                semester_number
             FROM semesters
             WHERE semester_id = :semester_id
             LIMIT 1
             """
         ),
         {"semester_id": semester_id},
-    ).scalar()
+    ).mappings().first()
 
-    if semester_exists is None:
+    if semester is None:
         raise HTTPException(
             status_code=400,
             detail="Selected semester does not exist.",
+        )
+
+    semester_number = int(semester["semester_number"])
+
+    if semester_number > max_semesters:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Selected department/branch has only {max_semesters} semester(s). "
+                f"Semester {semester_number} is outside its configured duration."
+            ),
         )
 
     section = db.execute(
         text(
             """
             SELECT
-                section_id,
-                semester_id,
-                is_active
-            FROM sections
-            WHERE section_id = :section_id
+                sec.section_id,
+                sec.semester_id,
+                sec.is_active,
+                sem.semester_number
+            FROM sections sec
+            INNER JOIN semesters sem
+                ON sem.semester_id = sec.semester_id
+            WHERE sec.section_id = :section_id
             LIMIT 1
             """
         ),
@@ -345,6 +380,8 @@ def _validate_faculty_requested_assignment(
             """
             SELECT
                 subject_id,
+                program_id,
+                branch_id,
                 semester_id,
                 is_active
             FROM subjects
@@ -367,6 +404,24 @@ def _validate_faculty_requested_assignment(
             detail="Selected subject is inactive.",
         )
 
+    if int(subject["program_id"]) != program_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected subject does not belong to "
+                "the selected program."
+            ),
+        )
+
+    if int(subject["branch_id"]) != branch_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected subject does not belong to "
+                "the selected department/branch."
+            ),
+        )
+
     if int(subject["semester_id"]) != semester_id:
         raise HTTPException(
             status_code=400,
@@ -384,6 +439,7 @@ def _validate_faculty_requested_assignment(
 def _validate_student_requested_section(
     db: Session,
     section_id: int,
+    max_semesters: int,
 ) -> None:
     section = db.execute(
         text(
@@ -416,6 +472,17 @@ def _validate_student_requested_section(
         raise HTTPException(
             status_code=409,
             detail="Selected section has no semester configured.",
+        )
+
+    semester_number = int(section["semester_number"])
+
+    if semester_number > max_semesters:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Selected department/branch has only {max_semesters} semester(s). "
+                f"Semester {semester_number} is outside its configured duration."
+            ),
         )
 
 
@@ -546,6 +613,9 @@ def register_user(
 
             _validate_faculty_requested_assignment(
                 db=db,
+                program_id=int(data.program_id),
+                branch_id=int(data.branch_id),
+                max_semesters=int(academic_branch["total_semesters"]),
                 semester_id=key[0],
                 section_id=key[1],
                 subject_id=key[2],
@@ -591,6 +661,7 @@ def register_user(
         _validate_student_requested_section(
             db=db,
             section_id=int(data.student_section_id),
+            max_semesters=int(academic_branch["total_semesters"]),
         )
 
     try:
@@ -926,4 +997,210 @@ def login_user(
         "full_name": user.full_name,
         "account_status": user.account_status,
         "message": "Login successful."
+    }
+
+
+# ============================================================
+# PASSWORD RESET - REQUEST
+# ============================================================
+
+def request_password_reset(
+    db: Session,
+    email: str,
+) -> dict:
+    """
+    Start password reset.
+
+    LOCAL TEST MODE:
+        If ALLOW_TEST_PASSWORD_RESET=True, a short-lived reset token
+        is returned directly for a registered email.
+
+    PRODUCTION LATER:
+        This same function becomes the place that creates/sends an OTP
+        or email link. The final password-confirm endpoint does not need
+        to be redesigned.
+    """
+
+    clean_email = email.strip().lower()
+
+    user = db.scalar(
+        select(User).where(
+            User.email == clean_email
+        )
+    )
+
+    generic_message = (
+        "If an account with this email exists, "
+        "password reset instructions are available."
+    )
+
+    # --------------------------------------------------------
+    # PRODUCTION-SAFE DEFAULT
+    # --------------------------------------------------------
+
+    if not settings.ALLOW_TEST_PASSWORD_RESET:
+        return {
+            "message": generic_message,
+            "test_reset_token": None,
+            "expires_in_minutes": None,
+            "test_mode": False,
+        }
+
+    # --------------------------------------------------------
+    # LOCAL TEST BYPASS
+    # --------------------------------------------------------
+
+    if user is None:
+        return {
+            "message": generic_message,
+            "test_reset_token": None,
+            "expires_in_minutes":
+                settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
+            "test_mode": True,
+        }
+
+    reset_token = create_password_reset_token(
+        user_id=user.user_id,
+        email=user.email,
+        password_hash=user.password_hash,
+    )
+
+    return {
+        "message": generic_message,
+        "test_reset_token": reset_token,
+        "expires_in_minutes":
+            settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
+        "test_mode": True,
+    }
+
+
+# ============================================================
+# PASSWORD RESET - CONFIRM
+# ============================================================
+
+def confirm_password_reset(
+    db: Session,
+    reset_token: str,
+    new_password: str,
+) -> dict:
+    """
+    Change the password after a valid short-lived reset token.
+
+    The token carries a fingerprint of the OLD password hash. Once the
+    password is changed, that fingerprint no longer matches, so the same
+    token cannot be reused.
+    """
+
+    try:
+        payload = decode_password_reset_token(
+            reset_token
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password reset session is invalid or expired. "
+                "Please start again."
+            ),
+        )
+
+    try:
+        user_id = int(
+            payload["sub"]
+        )
+    except (TypeError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password reset session is invalid or expired. "
+                "Please start again."
+            ),
+        )
+
+    token_email = str(
+        payload.get("email", "")
+    ).strip().lower()
+
+    token_password_fingerprint = str(
+        payload.get("pwd", "")
+    ).strip()
+
+    user = db.scalar(
+        select(User).where(
+            User.user_id == user_id,
+            User.email == token_email,
+        )
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password reset session is invalid or expired. "
+                "Please start again."
+            ),
+        )
+
+    current_fingerprint = password_hash_fingerprint(
+        user.password_hash
+    )
+
+    if (
+        not token_password_fingerprint
+        or token_password_fingerprint
+        != current_fingerprint
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This password reset session has already been used "
+                "or is no longer valid."
+            ),
+        )
+
+    if verify_password(
+        new_password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "New password must be different from "
+                "your current password."
+            ),
+        )
+
+    try:
+        new_password_hash = hash_password(
+            new_password
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    user.password_hash = new_password_hash
+
+    try:
+        db.commit()
+        db.refresh(user)
+
+    except Exception as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": "Unable to reset password.",
+                "error": str(exc),
+            },
+        )
+
+    return {
+        "message": (
+            "Password changed successfully. "
+            "You can now sign in with your new password."
+        ),
     }

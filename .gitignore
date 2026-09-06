@@ -30,3 +30,10 @@ Thumbs.db
 *.backup
 *.backup-*
 *.report-backup
+
+# Temporary patch scripts and patch backups
+*.before-*
+apply_*_patch.py
+faculty_assignment_info.txt
+README.txt
+apply_attendance_qr_utc_timer_fix.py
